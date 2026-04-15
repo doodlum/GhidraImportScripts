@@ -236,7 +236,7 @@ def load_pdb_types(pdb_path):
                         if mprop in (4, 5):
                             vbaseoff = struct.unpack_from('<i', tpi, p)[0]; p += 4
                         name, p = _pdb_read_cstr(tpi, p)
-                        if vbaseoff is not None and name and '<' not in name:
+                        if vbaseoff is not None and name and '<' not in name and 0 <= vbaseoff < 0x4000:
                             vfuncs.append((name, vbaseoff))
                     elif fld == _LF_NESTTYPE:
                         p += 2 + 4
@@ -721,7 +721,7 @@ def resolve_type(type_str):
         name = type_str[8:]
         vtbl_dt = created.get('vtbl:' + name)
         if vtbl_dt:
-            return PointerDataType(vtbl_dt, 8)
+            return dtm.getPointer(vtbl_dt, 8)
         return _PTR
     return None
 
@@ -734,6 +734,16 @@ def make_padding(size):
 GHIDRA_FOOTER = '''\
 
 def run_import():
+    # Wrap everything in one DTM transaction so Ghidra defers all database
+    # writes and GUI notifications until the end — dramatically reduces memory
+    # usage and time compared to one transaction per replaceAtOffset call.
+    tx = dtm.startTransaction('Import CommonLib types')
+    try:
+        _run_import_inner()
+    finally:
+        dtm.endTransaction(tx, True)
+
+def _run_import_inner():
     # Pass 1: create all enums
     monitor.setMessage('Creating enums...')
     for en in ENUMS:
@@ -1009,11 +1019,20 @@ def _build_vtable_structs(structs):
     for st in structs.values():
         if not st.get('has_vtable') and not st.get('vfuncs'):
             continue
-        slots = get_slots(st['full_name'])
-        if not slots:
+        named = get_slots(st['full_name'])
+        if not named:
             continue
-        sorted_slots = sorted(slots.items())  # [(vbaseoff, name)]
-        vtbl_size = sorted_slots[-1][0] + 8
+        max_off = max(named.keys())
+        vtbl_size = max_off + 8
+        # Fill every 8-byte slot — named slots keep their PDB names,
+        # gaps get generic names so Ghidra won't use array indexing.
+        # Cap at 0x4000 bytes (2048 slots) to guard against bogus vbaseoff values.
+        all_slots = dict(named)
+        if vtbl_size <= 0x4000:
+            for off in range(0, vtbl_size, 8):
+                if off not in all_slots:
+                    all_slots[off] = 'fn_{:03X}'.format(off)
+        sorted_slots = sorted(all_slots.items())
         vname = st['name'] + '_vtbl'
         vtable_structs[st['full_name']] = {
             'name': vname,
@@ -1096,7 +1115,12 @@ def _flatten_structs(structs):
                 for f in get_flat(base_st['full_name'], depth + 1):
                     abs_off = base_off + f['offset']
                     if abs_off not in combined:
-                        combined[abs_off] = dict(f, offset=abs_off)
+                        field_copy = dict(f, offset=abs_off)
+                        # Secondary vtable pointers (base placed at non-zero offset):
+                        # rename __vftable → __vftable_BaseName so they're identifiable
+                        if f['name'] == '__vftable' and base_off > 0:
+                            field_copy['name'] = '__vftable_' + base_st['name']
+                        combined[abs_off] = field_copy
         else:
             # No PDB base info — assume single base at offset 0
             for base_ref in st.get('bases', []):
