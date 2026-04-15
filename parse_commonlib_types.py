@@ -54,8 +54,19 @@ COMMONLIB_INCLUDE = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibSSE', 'include'
 SKYRIM_H = os.path.join(COMMONLIB_INCLUDE, 'RE', 'Skyrim.h')
 RE_INCLUDE = os.path.join(COMMONLIB_INCLUDE, 'RE')
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'ghidrascripts')
-OUTPUT_SCRIPT = os.path.join(OUTPUT_DIR, 'CommonLibTypes.py')
-PDB_SE_PATH = os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_SE_D.pdb')
+
+VERSIONS = {
+    'se': {
+        'defines':     [],
+        'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_SE_D.pdb'),
+        'output':      os.path.join(OUTPUT_DIR, 'CommonLibTypes_SE.py'),
+    },
+    'ae': {
+        'defines':     ['-DSKYRIM_AE', '-DSKYRIM_SUPPORT_AE'],
+        'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_AE_D.pdb'),
+        'output':      os.path.join(OUTPUT_DIR, 'CommonLibTypes_AE.py'),
+    },
+}
 
 # ---------------------------------------------------------------------------
 # PDB parser — DIA SDK via COM (primary), manual TPI stream (fallback)
@@ -250,13 +261,12 @@ def load_pdb_types(pdb_path):
         return {}
     return _load_pdb_types_dia(pdb_path)
 
-PARSE_ARGS = [
+PARSE_ARGS_BASE = [
     '-x', 'c++',
     '-std=c++23',
     '-fms-compatibility',
     '-fms-extensions',
     '-DWIN32', '-D_WIN64',
-    '-DENABLE_SKYRIM_AE',
     '-I' + COMMONLIB_INCLUDE,
 ]
 
@@ -503,6 +513,7 @@ def _collect_types(tu):
             fields = []
             bases = []
             has_vtable = False
+            vmethods = {}  # name -> (ret_type_str, [(param_name, param_type_str)])
 
             for child in cursor.get_children():
                 if child.kind == ci.CursorKind.CXX_BASE_SPECIFIER:
@@ -544,6 +555,18 @@ def _collect_types(tu):
                 elif child.kind == ci.CursorKind.CXX_METHOD:
                     if child.is_virtual_method():
                         has_vtable = True
+                        mname = child.spelling
+                        if mname and '<' not in mname and mname not in vmethods:
+                            try:
+                                ret = _map_type(child.result_type)
+                                params = []
+                                for i, p in enumerate(child.get_arguments()):
+                                    pname = p.spelling or 'p{}'.format(i)
+                                    ptype = _map_type(p.type)
+                                    params.append((pname, ptype))
+                                vmethods[mname] = (ret, params)
+                            except Exception:
+                                pass
 
             structs[full_name] = {
                 'name': cursor.spelling,
@@ -553,6 +576,7 @@ def _collect_types(tu):
                 'fields': fields,
                 'bases': bases,
                 'has_vtable': has_vtable,
+                'vmethods': vmethods,
             }
 
         # Always recurse into namespaces
@@ -613,10 +637,11 @@ from ghidra.program.model.data import (
     StructureDataType, EnumDataType, ArrayDataType, PointerDataType,
     CategoryPath, DataTypeConflictHandler,
     ByteDataType, WordDataType, DWordDataType, QWordDataType,
-    CharDataType, BooleanDataType,
+    CharDataType, BooleanDataType, VoidDataType,
     FloatDataType, DoubleDataType,
     ShortDataType, IntegerDataType, LongLongDataType,
     UnsignedShortDataType, UnsignedIntegerDataType, UnsignedLongLongDataType,
+    FunctionDefinitionDataType, ParameterDefinitionImpl,
 )
 
 dtm = currentProgram.getDataTypeManager()
@@ -624,6 +649,7 @@ CONFLICT = DataTypeConflictHandler.REPLACE_HANDLER
 
 created = {}  # full_name -> DataType
 
+_VOID  = VoidDataType()
 _BYTE  = ByteDataType()
 _PTR   = PointerDataType()
 _BOOL  = BooleanDataType()
@@ -637,6 +663,7 @@ _F32   = FloatDataType()
 _F64   = DoubleDataType()
 
 def get_builtin(type_str):
+    if type_str == 'void': return _VOID
     if type_str == 'bool': return _BOOL
     if type_str == 'i8':   return _BYTE
     if type_str == 'u8':   return _BYTE
@@ -724,10 +751,24 @@ def _run_import_inner():
     for vt in VTABLES:
         vname, vtbl_size, category, slots = vt
         s = StructureDataType(CategoryPath(category), vname, vtbl_size)
-        for slot_off, slot_name in slots:
+        for slot_off, slot_name, slot_ret, slot_params in slots:
             if slot_off + 8 <= vtbl_size:
                 try:
-                    s.replaceAtOffset(slot_off, _PTR, 8, slot_name, '')
+                    if slot_ret is not None and slot_params is not None:
+                        fdef = FunctionDefinitionDataType(CategoryPath(category), slot_name + '_t', dtm)
+                        ret_dt = resolve_type(slot_ret)
+                        if ret_dt:
+                            fdef.setReturnType(ret_dt)
+                        if slot_params:
+                            param_defs = []
+                            for pname, ptype in slot_params:
+                                pdt = resolve_type(ptype) or _PTR
+                                param_defs.append(ParameterDefinitionImpl(pname, pdt, ''))
+                            fdef.setArguments(param_defs)
+                        fptr = dtm.getPointer(dtm.addDataType(fdef, CONFLICT), 8)
+                        s.replaceAtOffset(slot_off, fptr, 8, slot_name, '')
+                    else:
+                        s.replaceAtOffset(slot_off, _PTR, 8, slot_name, '')
                 except Exception:
                     pass
         dt = dtm.addDataType(s, CONFLICT)
@@ -888,11 +929,15 @@ def _merge_pdb_into_structs(structs, pdb_types):
 
         elif clang['size'] == pdb_sz and pdb_sz > 1:
             size_ok += 1
-            # Sizes match — use PDB field names where libclang has the same offset
+            # Sizes match — fill PDB field names only where libclang has no name at that offset.
+            # libclang names come directly from C++ source so they always take priority; PDB is
+            # a fallback for offsets libclang couldn't resolve.
             clang_field_map = {f['offset']: f for f in clang['fields']}
             for pdb_fname, pdb_foff in pdb_fields:
                 if pdb_foff in clang_field_map:
-                    clang_field_map[pdb_foff]['name'] = pdb_fname
+                    existing = clang_field_map[pdb_foff]['name']
+                    if not existing:
+                        clang_field_map[pdb_foff]['name'] = pdb_fname
         else:
             size_mismatch += 1
 
@@ -934,7 +979,20 @@ def _build_vtable_structs(structs):
         by_name[st['full_name']] = st
         by_name[st['name']] = st
 
-    memo = {}  # full_name → {vbaseoff: method_name}
+    memo = {}     # full_name → {vbaseoff: method_name}
+    sig_memo = {} # full_name → {method_name: (ret_type_str, [(pname, ptype_str)])}
+
+    def _primary_base_st(st):
+        """Return the struct dict for the primary base (offset-0 base), or None."""
+        pdb_bases = st.get('pdb_bases', [])
+        if pdb_bases:
+            primary_name, primary_off = pdb_bases[0]
+            if primary_off == 0:
+                return by_name.get(primary_name) or by_name.get(primary_name.split('::')[-1])
+        else:
+            for base_ref in st.get('bases', []):
+                return by_name.get(base_ref) or by_name.get(base_ref.split('::')[-1])
+        return None
 
     def get_slots(full_name, depth=0):
         if depth > 20:
@@ -950,19 +1008,9 @@ def _build_vtable_structs(structs):
         slots = {}
 
         # Inherit from primary base (first base placed at offset 0)
-        pdb_bases = st.get('pdb_bases', [])
-        if pdb_bases:
-            primary_name, primary_off = pdb_bases[0]
-            if primary_off == 0:
-                bst = by_name.get(primary_name) or by_name.get(primary_name.split('::')[-1])
-                if bst:
-                    slots.update(get_slots(bst['full_name'], depth + 1))
-        else:
-            for base_ref in st.get('bases', []):
-                bst = by_name.get(base_ref) or by_name.get(base_ref.split('::')[-1])
-                if bst:
-                    slots.update(get_slots(bst['full_name'], depth + 1))
-                break
+        bst = _primary_base_st(st)
+        if bst:
+            slots.update(get_slots(bst['full_name'], depth + 1))
 
         # Own intro virtual methods override inherited ones at same offset
         for mname, vbaseoff in st.get('vfuncs', []):
@@ -971,6 +1019,27 @@ def _build_vtable_structs(structs):
 
         memo[full_name] = slots
         return slots
+
+    def get_sigs(full_name, depth=0):
+        """Collect inherited + own vmethods signatures: {name: (ret, params)}."""
+        if depth > 20:
+            return {}
+        if full_name in sig_memo:
+            return sig_memo[full_name]
+        st = by_name.get(full_name)
+        if not st:
+            sig_memo[full_name] = {}
+            return {}
+        sig_memo[full_name] = {}  # cycle guard
+
+        sigs = {}
+        bst = _primary_base_st(st)
+        if bst:
+            sigs.update(get_sigs(bst['full_name'], depth + 1))
+        sigs.update(st.get('vmethods', {}))
+
+        sig_memo[full_name] = sigs
+        return sigs
 
     vtable_structs = {}
     for st in structs.values():
@@ -989,7 +1058,13 @@ def _build_vtable_structs(structs):
             for off in range(0, vtbl_size, 8):
                 if off not in all_slots:
                     all_slots[off] = 'fn_{:03X}'.format(off)
-        sorted_slots = sorted(all_slots.items())
+        # Build sorted slots as 4-tuples: (offset, name, ret_type, params)
+        # ret_type and params come from libclang signature data; None if unknown.
+        sigs = get_sigs(st['full_name'])
+        sorted_slots = []
+        for off, name in sorted(all_slots.items()):
+            sig = sigs.get(name)
+            sorted_slots.append((off, name, sig[0] if sig else None, sig[1] if sig else None))
         vname = st['name'] + '_vtbl'
         vtable_structs[st['full_name']] = {
             'name': vname,
@@ -1105,14 +1180,21 @@ def _flatten_structs(structs):
     print('Flattening: {} structs have field data after inheritance expansion'.format(gained))
 
 
-def main():
+def run_version(version):
+    cfg = VERSIONS[version]
+    pdb_path = cfg['pdb']
+    output_path = cfg['output']
+    parse_args = PARSE_ARGS_BASE + cfg['defines']
+
+    print('\n=== {} ==='.format(version.upper()))
+
     if not os.path.isfile(SKYRIM_H):
         print('ERROR: Could not find Skyrim.h at', SKYRIM_H)
         sys.exit(1)
 
     print('Parsing CommonLibSSE headers...')
     idx = ci.Index.create()
-    tu = idx.parse(SKYRIM_H, args=PARSE_ARGS, options=PARSE_OPTIONS)
+    tu = idx.parse(SKYRIM_H, args=parse_args, options=PARSE_OPTIONS)
 
     errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
     if errors:
@@ -1124,22 +1206,26 @@ def main():
     enums, structs = _collect_types(tu)
     print('Found {} enums, {} structs/classes'.format(len(enums), len(structs)))
 
-    # Cross-reference with PDB type info
-    if os.path.isfile(PDB_SE_PATH):
-        print('Loading PDB type info from {}...'.format(os.path.basename(PDB_SE_PATH)))
-        pdb_types = load_pdb_types(PDB_SE_PATH)
+    if os.path.isfile(pdb_path):
+        print('Loading PDB type info from {}...'.format(os.path.basename(pdb_path)))
+        pdb_types = load_pdb_types(pdb_path)
         print('Found {} RE:: types in PDB'.format(len(pdb_types)))
         _merge_pdb_into_structs(structs, pdb_types)
     else:
-        print('PDB not found at {}, skipping cross-reference'.format(PDB_SE_PATH))
+        print('PDB not found at {}, skipping cross-reference'.format(pdb_path))
 
     vtable_structs = _build_vtable_structs(structs)
     _inject_vtable_fields(structs, vtable_structs)
     _flatten_structs(structs)
 
     print('Generating Ghidra script...')
-    n_enums, n_structs = generate_script(enums, structs, vtable_structs, OUTPUT_SCRIPT)
-    print('Output: {} ({} enums, {} structs)'.format(OUTPUT_SCRIPT, n_enums, n_structs))
+    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path)
+    print('Output: {} ({} enums, {} structs)'.format(output_path, n_enums, n_structs))
+
+
+def main():
+    for version in ('se', 'ae'):
+        run_version(version)
 
 
 if __name__ == '__main__':

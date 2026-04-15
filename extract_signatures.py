@@ -870,28 +870,31 @@ def main():
         if ae_off: sym['a'] = ae_off
         symbols.append(sym)
 
-    # Fallback: add names from AE rename database for any addresses not yet covered
+    # Fallback: add names from AE rename database for any addresses not yet covered.
+    # name_counts_ae tracks names already assigned an AE address (from any source).
     rename_db_path = os.path.join(base_dir, 'extern', 'AddressLibraryDatabase', 'skyrimae.rename')
     ae_rename = load_ae_rename_db(rename_db_path, addr_lib.ae_db)
-    name_counts = {}
+    name_counts_ae = {}
+    name_counts_se = {}
     for s in symbols:
-        name_counts[s['n']] = name_counts.get(s['n'], 0) + 1
+        if s.get('a'):
+            name_counts_ae[s['n']] = name_counts_ae.get(s['n'], 0) + 1
+        if s.get('s'):
+            name_counts_se[s['n']] = name_counts_se.get(s['n'], 0) + 1
     rename_added = 0
     for ae_off, name in ae_rename.items():
         if ae_off in seen_offsets_ae:
             continue
         seen_offsets_ae.add(ae_off)
-        if name in name_counts:
-            name_counts[name] += 1
-            unique_name = f'{name}_{name_counts[name]}'
-        else:
-            name_counts[name] = 1
-            unique_name = name
-        symbols.append({'n': unique_name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'})
+        if name in name_counts_ae:
+            continue  # Name already has an AE address from a higher-priority source
+        name_counts_ae[name] = 1
+        symbols.append({'n': name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'})
         rename_added += 1
     print(f"Added {rename_added} symbols from AE rename database")
 
-    # Fallback: add names from SE PDB for any SE addresses not yet covered
+    # Fallback: add names from SE PDB for any SE addresses not yet covered.
+    # Treated independently from AE rename — same name can appear in both versions.
     se_pdb_path = os.path.join(base_dir, 'pdbs', 'SkyrimSE.pdb')
     se_pdb = load_se_pdb_names(se_pdb_path)
     print(f"Loaded {len(se_pdb)} public function symbols from SE PDB")
@@ -900,13 +903,10 @@ def main():
         if se_off in seen_offsets_se:
             continue
         seen_offsets_se.add(se_off)
-        if name in name_counts:
-            name_counts[name] += 1
-            unique_name = f'{name}_{name_counts[name]}'
-        else:
-            name_counts[name] = 1
-            unique_name = name
-        symbols.append({'n': unique_name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'})
+        if name in name_counts_se:
+            continue  # Name already has an SE address from a higher-priority source
+        name_counts_se[name] = 1
+        symbols.append({'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'})
         pdb_added += 1
     print(f"Added {pdb_added} symbols from SE PDB")
 
