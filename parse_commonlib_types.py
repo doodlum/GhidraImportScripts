@@ -5,6 +5,76 @@ Parse CommonLibSSE headers using libclang and generate a Ghidra import script
 
 Requires Python 3.x (64-bit) with the libclang package installed.
 Run with: py -3.13 parse_commonlib_types.py
+
+--------------------------------------------------------------------------------
+KNOWN LIMITATIONS
+--------------------------------------------------------------------------------
+
+FUNCTION SIGNATURES — src/ unity parse
+  When a .cpp file's REL::Relocation<func_t> VAR_DECL fails to instantiate (due
+  to complex template parameter types such as BSScrapArray<ActorHandle>* that are
+  only partially resolved under libclang's error recovery), the VAR_DECL type
+  degrades to 'int'.  A token-stream fallback recovers the offset/address in that
+  case, but the parameter types in the emitted signature are taken from the
+  enclosing CXX_METHOD cursor — which also shows degraded types (e.g. 'int *'
+  instead of 'BSScrapArray<ActorHandle> *').  The function is found at the correct
+  address; only the parameter type spelling is wrong.
+
+FUNCTION SIGNATURES — Offset:: namespace
+  Functions that use RE::Offset:: IDs (instead of RELOCATION_ID()) resolve via a
+  two-stage fallback: AST DECL_REF_EXPR first, then raw token scan.  The token
+  fallback only recognises the pattern 'Offset::X::Y' immediately after '{'; more
+  exotic initialisers (nested templates, macros that expand to Offset references)
+  are silently skipped.
+
+MISSING FUNCTIONS (~25 out of ~1000)
+  A small number of functions in the Skyrim.h header parse are absent because:
+    - Their REL::Relocation<> specialisation uses a type not visible at parse time.
+    - The enclosing class is itself a template that libclang does not instantiate.
+  These are not recovered by any fallback; they must be added manually or found
+  via the AE rename database / SE PDB if available.
+
+STATIC METHOD DETECTION
+  'static' is inferred from the libclang AST when a CXX_METHOD is marked
+  is_static_method().  For src/.cpp definitions the static flag comes from the
+  enclosing CXX_METHOD cursor; if that cursor is not static (because the .cpp
+  definition omits the keyword and libclang cannot match it to the declaration),
+  the flag defaults to False.  The Skyrim.h header parse does correctly mark
+  statics, so header-derived symbols are unaffected.
+
+MISSING DEPENDENCY: binary_io
+  'binary_io/file_stream.hpp' is not present in the extern/ tree.  libclang
+  emits one error per parse pass but recovers; all types that depend on that
+  header are either skipped or receive error-recovery ('int') types.
+
+STRUCT FIELD SIZES — PDB cross-reference
+  PDB type info is loaded via DIA SDK (COM) or a manual TPI stream parser.
+  ~300 structs per version show a size mismatch between the PDB and libclang;
+  these are kept with libclang's field layout and flagged internally.  If the
+  PDB is absent, all struct sizes fall back to libclang's sizeof estimate, which
+  may be incorrect for types with compiler-specific padding or #pragma pack.
+
+VTABLE SLOT COMPUTATION
+  Vtable slot indices are computed from the libclang AST by counting virtual
+  method declarations in base-class order.  Multiple inheritance and virtual
+  base classes are handled, but diamond inheritance with shared virtual bases
+  may produce incorrect slot numbers.
+
+TEMPLATE INSTANTIATIONS
+  libclang only sees explicit instantiations and specialisations present in the
+  parsed headers.  Generic template bodies (e.g. NiPointer<T>, BSTArray<T>) are
+  not expanded for every T in use — those fields appear with their template
+  parameter types, not the concrete substituted types.
+
+AE OFFSET MAP COMPLETENESS
+  The AE offset map is built from the same Skyrim.h parse as the SE map.  If a
+  function only has an AE-side RELOCATION_ID (i.e. no SE counterpart), it is
+  captured; however the se_off field will be None and the symbol will not appear
+  in the SE output script.
+
+32-BIT PYTHON
+  libclang.dll is 64-bit; the script will exit at startup on 32-bit Python
+  interpreters.  Use a 64-bit Python 3.x build.
 """
 
 import os
@@ -279,6 +349,8 @@ PARSE_OPTIONS = (
     ci.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES |
     ci.TranslationUnit.PARSE_INCOMPLETE
 )
+# Full parse (includes function bodies) — used for relocation ID collection
+PARSE_OPTIONS_FULL = ci.TranslationUnit.PARSE_INCOMPLETE
 
 # ---------------------------------------------------------------------------
 # Type mapping helpers
@@ -1334,6 +1406,96 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
 # Main
 # ---------------------------------------------------------------------------
 
+def _compute_vfuncs_from_libclang(structs):
+    """Derive vtable slot byte-offsets from the libclang class hierarchy.
+
+    An 'intro virtual' is a virtual method declared in this class whose name
+    does not appear anywhere in the primary base's accumulated virtual method set.
+    Slots are assigned in declaration order starting after the primary base's
+    total slot count.
+
+    Stores st['vfuncs'] = [(method_name, byte_offset)] on qualifying structs.
+    The PDB merge step will override these with more precise compiled data when
+    the PDB is available.
+    """
+    slot_cache    = {}  # full_name → total vtable slot count
+    vmname_cache  = {}  # full_name → frozenset of all virtual method names (recursive)
+
+    def resolve(name):
+        return structs.get(name) or structs.get(name.split('::')[-1])
+
+    def all_vmethod_names(full_name, depth=0):
+        """All virtual method names visible in full_name's vtable (own + inherited)."""
+        if depth > 30:
+            return frozenset()
+        if full_name in vmname_cache:
+            return vmname_cache[full_name]
+        vmname_cache[full_name] = frozenset()  # cycle guard
+        st = structs.get(full_name)
+        if not st:
+            return frozenset()
+        result = set(st.get('vmethods', {}).keys())
+        for base_name in st.get('bases', []):
+            bs = resolve(base_name)
+            if bs:
+                result |= all_vmethod_names(bs['full_name'], depth + 1)
+            break  # primary base only (vtable chain is primary base chain)
+        frozen = frozenset(result)
+        vmname_cache[full_name] = frozen
+        return frozen
+
+    def total_slots(full_name, depth=0):
+        """Total vtable slots in full_name including all inherited intro virtuals."""
+        if depth > 30:
+            return 0
+        if full_name in slot_cache:
+            return slot_cache[full_name]
+        slot_cache[full_name] = 0  # cycle guard
+        st = structs.get(full_name)
+        if not st:
+            return 0
+        # Primary base contributes all its slots
+        base_count = 0
+        for base_name in st.get('bases', []):
+            bs = resolve(base_name)
+            if bs:
+                base_count = total_slots(bs['full_name'], depth + 1)
+            break
+        # Own intro virtuals = vmethods whose names are NOT in primary base's full set
+        primary_base_names = frozenset()
+        for base_name in st.get('bases', []):
+            bs = resolve(base_name)
+            if bs:
+                primary_base_names = all_vmethod_names(bs['full_name'])
+            break
+        own_intro = sum(1 for n in st.get('vmethods', {}) if n not in primary_base_names)
+        result = base_count + own_intro
+        slot_cache[full_name] = result
+        return result
+
+    count = 0
+    for st in structs.values():
+        if not st.get('has_vtable'):
+            continue
+        # Get primary base's accumulated vmethods and slot count
+        primary_base_names = frozenset()
+        base_start = 0
+        for base_name in st.get('bases', []):
+            bs = resolve(base_name)
+            if bs:
+                primary_base_names = all_vmethod_names(bs['full_name'])
+                base_start = total_slots(bs['full_name'])
+            break
+        # Intro virtuals in declaration order
+        intro = [n for n in st.get('vmethods', {}) if n not in primary_base_names]
+        if not intro:
+            continue
+        st['vfuncs'] = [(mname, (base_start + i) * 8) for i, mname in enumerate(intro)]
+        count += 1
+
+    print('Computed vtable slots for {} structs from libclang'.format(count))
+
+
 def _merge_pdb_into_structs(structs, pdb_types):
     """
     Cross-reference libclang struct data with PDB TPI data.
@@ -1649,6 +1811,485 @@ def _flatten_structs(structs):
     print('Flattening: {} structs have field data after inheritance expansion'.format(gained))
 
 
+def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
+    """Walk the CommonLibSSE AST to collect function symbols and RTTI/VTABLE labels.
+
+    For function symbols: finds VAR_DECL nodes whose type contains 'REL::Relocation<'.
+    When the var is inside an inline function body, uses the enclosing function's name,
+    class, return type, and parameter types directly from the AST (no regex).
+    For namespace-level vars, parses the normalized type spelling.
+
+    For RTTI_*/VTABLE_* labels: reads the first integer literal from the constructor.
+
+    Handles Offset:: references (used instead of RELOCATION_ID in some headers) by
+    pre-scanning REL::ID VAR_DECLs in the Offset namespace and following DECL_REF_EXPR
+    links at use sites.
+
+    is_ae: when True, RELOCATION_ID expands to REL::RelocationID(se, ae) → 2 integers.
+           when False, it expands to REL::ID(se) → 1 integer.
+
+    Returns (func_syms, label_syms):
+      func_syms: [{'name','class_','ret','params','is_static','se_off','ae_off'}, ...]
+      label_syms: [{'name','se_off','ae_off'}, ...]
+    """
+    # --- Step 1: Build lookup for Offset:: REL::ID vars ---
+    # e.g. RE::Offset::Actor::AddShout → integer ID
+    offset_id_map = {}  # stripped_qual_name → integer_id
+
+    def get_int_literals(cursor, depth=0):
+        """Recursively collect INTEGER_LITERAL values from cursor's AST children."""
+        if depth > 12: return []
+        vals = []
+        if cursor.kind == ci.CursorKind.INTEGER_LITERAL:
+            toks = list(cursor.get_tokens())
+            if toks:
+                s = toks[0].spelling.rstrip('uUlLfF')
+                try: vals.append(int(s, 0))
+                except ValueError: pass
+        for c in cursor.get_children():
+            vals.extend(get_int_literals(c, depth + 1))
+        return vals
+
+    def get_ints_from_token_stream(parent_cursor, var_name):
+        """Extract integer IDs from the parent DECL_STMT's token stream.
+
+        Used when VAR_DECL initializer children are not exposed by libclang
+        (e.g. 'static REL::Relocation<func_t> func{ RELOCATION_ID(37842, 38797) }').
+        Finds the var name in the token list then reads numeric tokens after '{'.
+        """
+        tokens = [t.spelling for t in parent_cursor.get_tokens()]
+        # Find the last occurrence of the variable name to locate the initializer
+        try:
+            var_idx = len(tokens) - 1 - tokens[::-1].index(var_name)
+        except ValueError:
+            return []
+        # Collect integers from after the variable name (inside the { ... })
+        vals = []
+        for tok in tokens[var_idx + 1:]:
+            tok_clean = tok.rstrip('uUlLfF')
+            if not tok_clean:
+                continue
+            if tok == '}' or tok == ';':
+                break
+            try:
+                vals.append(int(tok_clean, 0))
+            except ValueError:
+                pass
+        return vals
+
+    def get_ints_from_cursor_forward(cursor):
+        """Tokenize source range just after cursor extent end to capture initializer.
+
+        For global constexpr std::array<REL::ID,N> VTABLE_Name{ REL::ID(id),... }
+        vars, libclang's cursor extent ends at the variable name (before the { }).
+        We forward-tokenize up to 2000 columns on the same line to find the integers.
+        """
+        try:
+            ext = cursor.extent
+            end = ext.end
+            f   = end.file
+            if not f:
+                return []
+            start_loc = ci.SourceLocation.from_position(tu, f, end.line, end.column)
+            end_loc   = ci.SourceLocation.from_position(tu, f, end.line, end.column + 2000)
+            fwd_range = ci.SourceRange.from_locations(start_loc, end_loc)
+            fwd_toks  = [t.spelling for t in tu.get_tokens(extent=fwd_range)]
+        except Exception:
+            return []
+        vals = []
+        for tok in fwd_toks:
+            if tok in ('}', ';'):
+                break
+            tok_clean = tok.rstrip('uUlLfF')
+            try:
+                vals.append(int(tok_clean, 0))
+            except ValueError:
+                pass
+        return vals
+
+    def _scan_offset_ids(cursor, depth=0):
+        if depth > 20: return
+        if cursor.kind == ci.CursorKind.VAR_DECL:
+            ts = cursor.type.spelling
+            if ts in ('REL::ID', 'const REL::ID') and not cursor.spelling.startswith(('RTTI_', 'VTABLE_')):
+                ids = get_int_literals(cursor)
+                if ids:
+                    full = _get_full_qual_name(cursor)
+                    for pfx in ('RE::Offset::', 'Offset::'):
+                        if full.startswith(pfx):
+                            full = full[len(pfx):]
+                            break
+                    offset_id_map[full] = ids[0]
+        for c in cursor.get_children():
+            _scan_offset_ids(c, depth + 1)
+
+    _scan_offset_ids(tu.cursor)
+    if extra_offset_map:
+        offset_id_map.update(extra_offset_map)
+
+    # --- Step 2: Collect function symbols and labels ---
+    func_syms = []
+    label_syms = []
+    seen_se = set()
+    seen_ae = set()
+
+    def parse_reloc_spelling(type_sp):
+        """Parse 'REL::Relocation<T>' to (ret, class_or_None, params) as C++ strings."""
+        m = re.match(r'^REL::Relocation<(.+)>$', type_sp.strip())
+        if not m: return None
+        inner = m.group(1).strip()
+        # Member function pointer: 'ret (Ns::Cls::*)(params)'
+        mfp = re.match(r'^(.+?)\s*\(([\w:]+)::\*\)\s*\(([^)]*)\)', inner)
+        if mfp:
+            return mfp.group(1).strip(), mfp.group(2), mfp.group(3).strip()
+        # Function type: 'ret (params)' — find the outermost trailing parens
+        depth_p = 0; last_open = -1
+        for i in range(len(inner) - 1, -1, -1):
+            if inner[i] == ')': depth_p += 1
+            elif inner[i] == '(':
+                depth_p -= 1
+                if depth_p == 0: last_open = i; break
+        if last_open < 0: return None
+        return inner[:last_open].strip(), None, inner[last_open+1:-1].strip()
+
+    def get_offset_ref_ids(cursor, depth=0):
+        """Follow a DECL_REF_EXPR to a REL::ID var in the Offset namespace."""
+        if depth > 8: return None, None
+        if cursor.kind == ci.CursorKind.DECL_REF_EXPR and cursor.referenced:
+            full = _get_full_qual_name(cursor.referenced)
+            for pfx in ('RE::Offset::', 'Offset::'):
+                if full.startswith(pfx):
+                    full = full[len(pfx):]
+                    break
+            the_id = offset_id_map.get(full)
+            if the_id:
+                return (the_id, None) if not is_ae else (None, the_id)
+        for c in cursor.get_children():
+            r = get_offset_ref_ids(c, depth + 1)
+            if r != (None, None): return r
+        return None, None
+
+    def get_offset_from_tokens(parent_cursor, var_name):
+        """Token-stream fallback for Offset:: refs whose DECL_REF_EXPR doesn't resolve.
+
+        Used when parsing src/.cpp files without the Offset namespace in scope:
+        reconstruct 'ClassName::Method' from tokens and look it up in offset_id_map.
+        """
+        tokens = [t.spelling for t in parent_cursor.get_tokens()]
+        try:
+            var_idx = len(tokens) - 1 - tokens[::-1].index(var_name)
+        except ValueError:
+            return None, None
+        # Scan initializer { ... } for 'Offset :: Parts :: ...'
+        toks = tokens[var_idx + 1:]
+        try:
+            brace = toks.index('{')
+        except ValueError:
+            return None, None
+        parts = []
+        i = brace + 1
+        while i < len(toks) and toks[i] not in ('}', ';'):
+            if toks[i] == 'Offset' and i + 1 < len(toks) and toks[i + 1] == '::':
+                i += 2  # skip 'Offset' '::'
+                while i < len(toks) and toks[i] not in ('}', ';', ','):
+                    if toks[i] != '::':
+                        parts.append(toks[i])
+                    i += 1
+                break
+            i += 1
+        if not parts:
+            return None, None
+        key = '::'.join(parts)
+        the_id = offset_id_map.get(key)
+        if the_id is None:
+            return None, None
+        return (the_id, None) if not is_ae else (None, the_id)
+
+    def params_to_str(func_cursor):
+        try:
+            parts = []
+            for i, p in enumerate(func_cursor.get_arguments()):
+                ptype = p.type.spelling
+                pname = p.spelling or 'p{}'.format(i)
+                parts.append('{} {}'.format(ptype, pname).strip())
+            return ', '.join(parts)
+        except Exception:
+            return ''
+
+    _GENERIC_VAR_NAMES = frozenset({
+        'func', 'fn', 'function', 'call', 'impl', 'f', 'thunk', 'trampoline',
+        'orig', 'detour', 'hook', 'target', 'addr', 'address',
+    })
+
+    def walk(cursor, parent=None, enc_name=None, enc_class=None, enc_ret=None,
+             enc_params=None, enc_static=False, depth=0):
+        if depth > 60: return
+        kind = cursor.kind
+
+        # Track entering an inline function/method definition
+        if kind in (ci.CursorKind.CXX_METHOD, ci.CursorKind.FUNCTION_DECL) and cursor.is_definition():
+            fname = cursor.spelling
+            fcls = None
+            if kind == ci.CursorKind.CXX_METHOD:
+                p = cursor.semantic_parent
+                if p and p.kind in (ci.CursorKind.CLASS_DECL, ci.CursorKind.STRUCT_DECL):
+                    fcls = _get_full_qual_name(p)
+                    if fcls and fcls.startswith('RE::'):
+                        fcls = fcls[4:]
+            else:
+                # FUNCTION_DECL: capture namespace as "class" so symbols get fully qualified names.
+                # e.g. SendHUDMessage::PopHUDMode instead of just PopHUDMode.
+                p = cursor.semantic_parent
+                if p and p.kind == ci.CursorKind.NAMESPACE and p.spelling not in ('RE', 'detail', ''):
+                    fcls = _get_full_qual_name(p)
+                    if fcls and fcls.startswith('RE::'):
+                        fcls = fcls[4:]
+            try:
+                fret = cursor.result_type.spelling
+                fps = params_to_str(cursor)
+                fstatic = cursor.is_static_method()
+            except Exception:
+                fret = ''; fps = ''; fstatic = False
+            for c in cursor.get_children():
+                walk(c, cursor, fname, fcls, fret, fps, fstatic, depth + 1)
+            return
+
+        if kind == ci.CursorKind.VAR_DECL:
+            var_name = cursor.spelling
+            type_sp = cursor.type.spelling
+
+            if 'REL::Relocation<' in type_sp:
+                # Try AST integer literal children first (works for some namespace-level vars)
+                ids = get_int_literals(cursor)
+                # Fallback: read the parent DECL_STMT's token stream
+                # (libclang doesn't expose static local initializers as VAR_DECL children)
+                if not ids and parent is not None:
+                    ids = get_ints_from_token_stream(parent, var_name)
+                se_id = ae_id = None
+                if is_ae:
+                    if len(ids) >= 2: se_id, ae_id = ids[0], ids[1]
+                    elif len(ids) == 1: ae_id = ids[0]
+                else:
+                    if ids: se_id = ids[0]
+
+                # Fall back to Offset:: reference lookup (AST-based, then token-based)
+                if not se_id and not ae_id:
+                    se_id, ae_id = get_offset_ref_ids(cursor)
+                # Token fallback: DECL_REF_EXPR doesn't resolve when the Offset
+                # namespace wasn't in scope during parsing (e.g. unity src/ parse).
+                if not se_id and not ae_id and parent is not None:
+                    se_id, ae_id = get_offset_from_tokens(parent, var_name)
+
+                se_off = addr_lib.se_db.get(se_id) if se_id else None
+                ae_off = addr_lib.ae_db.get(ae_id) if ae_id else None
+
+                if se_off or ae_off:
+                    if enc_name and enc_name.lower() not in _GENERIC_VAR_NAMES:
+                        sym_name = enc_name
+                        sym_class = enc_class
+                        sym_ret = enc_ret
+                        sym_params = enc_params
+                        sym_static = enc_static
+                    else:
+                        sym_name = var_name
+                        sym_class = None
+                        sig = parse_reloc_spelling(type_sp)
+                        sym_ret = sig[0] if sig else ''
+                        sym_params = sig[2] if sig else ''
+                        sym_static = False
+
+                    # Deduplicate by SE offset (prefer) then AE offset
+                    if se_off and se_off not in seen_se:
+                        seen_se.add(se_off)
+                        if ae_off: seen_ae.add(ae_off)
+                        func_syms.append({
+                            'name': sym_name, 'class_': sym_class,
+                            'ret': sym_ret, 'params': sym_params,
+                            'is_static': sym_static,
+                            'se_off': se_off, 'ae_off': ae_off,
+                        })
+                    elif ae_off and ae_off not in seen_ae:
+                        seen_ae.add(ae_off)
+                        func_syms.append({
+                            'name': sym_name, 'class_': sym_class,
+                            'ret': sym_ret, 'params': sym_params,
+                            'is_static': sym_static,
+                            'se_off': None, 'ae_off': ae_off,
+                        })
+
+            elif (type_sp == 'int' and enc_name and
+                  enc_name.lower() not in _GENERIC_VAR_NAMES and
+                  parent is not None):
+                # REL::Relocation<func_t> degrades to 'int' under libclang error
+                # recovery when complex template parameter types fail to instantiate
+                # (e.g. BSScrapArray<ActorHandle>* params in unity src/ parse).
+                # The enclosing CXX_METHOD context (enc_name/enc_class/enc_ret/enc_params)
+                # is still correct — only the VAR_DECL type is broken.
+                ids = get_ints_from_token_stream(parent, var_name)
+                se_id = ae_id = None
+                if ids:
+                    if is_ae:
+                        if len(ids) >= 2: se_id, ae_id = ids[0], ids[1]
+                        elif len(ids) == 1: ae_id = ids[0]
+                    else:
+                        if ids: se_id = ids[0]
+                if not se_id and not ae_id:
+                    se_id, ae_id = get_offset_from_tokens(parent, var_name)
+
+                se_off = addr_lib.se_db.get(se_id) if se_id else None
+                ae_off = addr_lib.ae_db.get(ae_id) if ae_id else None
+
+                if se_off or ae_off:
+                    if se_off and se_off not in seen_se:
+                        seen_se.add(se_off)
+                        if ae_off: seen_ae.add(ae_off)
+                        func_syms.append({
+                            'name': enc_name, 'class_': enc_class,
+                            'ret': enc_ret, 'params': enc_params,
+                            'is_static': enc_static,
+                            'se_off': se_off, 'ae_off': ae_off,
+                        })
+                    elif ae_off and ae_off not in seen_ae:
+                        seen_ae.add(ae_off)
+                        func_syms.append({
+                            'name': enc_name, 'class_': enc_class,
+                            'ret': enc_ret, 'params': enc_params,
+                            'is_static': enc_static,
+                            'se_off': None, 'ae_off': ae_off,
+                        })
+
+            elif var_name.startswith(('RTTI_', 'VTABLE_')):
+                # Always use forward-tokenization: reads the actual initializer source
+                # directly, avoiding the false-positive array-size INTEGER_LITERAL that
+                # appears as an AST child of std::array<REL::ID,N> VAR_DECLs.
+                ids = get_ints_from_cursor_forward(cursor)
+                if not ids:
+                    ids = get_int_literals(cursor)
+                if ids:
+                    the_id = ids[0]
+                    if is_ae:
+                        off = addr_lib.ae_db.get(the_id)
+                        if off and the_id not in seen_ae:
+                            seen_ae.add(the_id)
+                            label_syms.append({'name': var_name, 'se_off': None, 'ae_off': off})
+                    else:
+                        off = addr_lib.se_db.get(the_id)
+                        if off and the_id not in seen_se:
+                            seen_se.add(the_id)
+                            label_syms.append({'name': var_name, 'se_off': off, 'ae_off': None})
+
+        for c in cursor.get_children():
+            walk(c, cursor, enc_name, enc_class, enc_ret, enc_params, enc_static, depth + 1)
+
+    walk(tu.cursor)
+
+    # Collect static method declarations from header AST so _scan_src_files can
+    # correctly mark static methods even when their .cpp definition lacks 'static'.
+    static_methods = set()  # frozenset of (qualified_class_name, method_name)
+
+    def _scan_static_methods(cursor, depth=0):
+        if depth > 40: return
+        if cursor.kind == ci.CursorKind.CXX_METHOD and cursor.is_static_method():
+            sp = cursor.semantic_parent
+            if sp:
+                cls = _get_full_qual_name(sp)
+                if cls.startswith('RE::'):
+                    cls = cls[4:]
+                static_methods.add((cls, cursor.spelling))
+        for c in cursor.get_children():
+            _scan_static_methods(c, depth + 1)
+
+    _scan_static_methods(tu.cursor)
+
+    mode = 'AE' if is_ae else 'SE'
+    print('  {} relocation scan: {} func symbols, {} labels, {} static methods'.format(
+        mode, len(func_syms), len(label_syms), len(static_methods)))
+    return func_syms, label_syms, offset_id_map, static_methods
+
+
+def _collect_src_relocations(src_dir, addr_lib, se_offset_map=None, ae_offset_map=None):
+    """Parse CommonLibSSE src/*.cpp via libclang and collect function symbols.
+
+    Builds an in-memory unity file that #includes every src .cpp, parses it
+    via libclang for both SE and AE modes (same path as the Skyrim.h parse),
+    and returns merged func_syms with both se_off and ae_off where available.
+
+    se_offset_map / ae_offset_map: Offset:: namespace ID maps already built from
+    the Skyrim.h parse.  Injected into the unity TU's offset lookup so that
+    Offset:: references in src/ files resolve correctly without needing to
+    re-parse the Offset namespace (which requires SKSE's PCH to compile).
+
+    Using libclang here instead of regex means the function names, return types,
+    parameter types, and static/virtual qualifiers are all read directly from the
+    C++ AST — no pattern matching, no fragility around unusual formatting.
+    """
+    cpp_files = sorted(glob.glob(os.path.join(src_dir, '**', '*.cpp'), recursive=True))
+    if not cpp_files:
+        return []
+
+    # Build unity file content: #include every .cpp with its absolute path.
+    # Forward slashes work on Windows under libclang/LLVM.
+    # RE/Skyrim.h must come first: it pulls in SKSE/Impl/PCH.h which provides
+    # <cstdint> and other standard types needed by REL/Version.h → REL/Module.h.
+    # Without it, REL::Relocation<T> degrades to 'int' under libclang's error
+    # recovery, making VAR_DECL type checks fail.  After Skyrim.h is parsed once,
+    # all subsequent #includes in the .cpp files hit header guards and are free.
+    unity_lines = [
+        '// libclang unity parse — auto-generated, not written to disk\n',
+        '#include "RE/Skyrim.h"\n',
+    ]
+    for p in cpp_files:
+        unity_lines.append('#include "{}"\n'.format(p.replace('\\', '/')))
+    unity_content = ''.join(unity_lines)
+
+    # Virtual path: located in src_dir so relative includes inside the .cpp
+    # files resolve against the same directory they would during a real build.
+    unity_vpath = os.path.join(src_dir, '_unity_parse.cpp').replace('\\', '/')
+
+    se_funcs = []
+    ae_funcs = []
+
+    for version, is_ae in (('se', False), ('ae', True)):
+        cfg = VERSIONS[version]
+        parse_args = PARSE_ARGS_BASE + cfg['defines']
+        idx = ci.Index.create()
+        tu = idx.parse(
+            unity_vpath,
+            args=parse_args,
+            unsaved_files=[(unity_vpath, unity_content)],
+            options=PARSE_OPTIONS_FULL,
+        )
+        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
+        if errors:
+            print('  src/ {} unity errors ({} total, first 5):'.format(
+                version.upper(), len(errors)))
+            for e in errors[:5]:
+                f = e.location.file
+                print('    {}:{}: {}'.format(
+                    os.path.basename(f.name) if f else '?', e.location.line, e.spelling))
+        extra = ae_offset_map if is_ae else se_offset_map
+        fs, _ls, _off_map, _sm = _collect_relocations_from_tu(
+            tu, addr_lib, is_ae, extra_offset_map=extra)
+        print('  src/ {} scan: {} func symbols'.format(version.upper(), len(fs)))
+        if is_ae:
+            ae_funcs = fs
+        else:
+            se_funcs = fs
+
+    # Merge: AE funcs have both offsets from RELOCATION_ID(se, ae).
+    # Add any SE-only funcs (Offset:: refs that only yield a SE ID).
+    seen_se = {f['se_off'] for f in ae_funcs if f['se_off']}
+    merged  = list(ae_funcs)
+    for f in se_funcs:
+        if f['se_off'] and f['se_off'] not in seen_se:
+            seen_se.add(f['se_off'])
+            merged.append(f)
+
+    print('  src/ merged: {} func symbols from {} cpp files'.format(
+        len(merged), len(cpp_files)))
+    return merged
+
+
 def run_version(version, symbols_json):
     cfg = VERSIONS[version]
     pdb_path = cfg['pdb']
@@ -1675,6 +2316,8 @@ def run_version(version, symbols_json):
     enums, structs = _collect_types(tu)
     print('Found {} enums, {} structs/classes'.format(len(enums), len(structs)))
 
+    _compute_vfuncs_from_libclang(structs)
+
     if os.path.isfile(pdb_path):
         print('Loading PDB type info from {}...'.format(os.path.basename(pdb_path)))
         pdb_types = load_pdb_types(pdb_path)
@@ -1698,10 +2341,135 @@ def main():
     _sys.path.insert(0, SCRIPT_DIR)
     import extract_signatures
 
-    print('=== Generating symbols (version-agnostic) ===')
-    symbols = extract_signatures.generate_symbols(SCRIPT_DIR)
+    # Load address databases (binary data, not source scanning)
+    addr_lib = extract_signatures.AddressLibrary()
+    addr_lib.load_all(os.path.join(SCRIPT_DIR, 'addresslibrary'))
+    print('SE entries: {}, AE entries: {}'.format(len(addr_lib.se_db), len(addr_lib.ae_db)))
+
+    # Parse both versions with full function-body parsing to collect relocation IDs
+    print('\n=== Collecting symbols via libclang ===')
+    se_func_syms = []
+    se_label_syms = []
+    ae_func_syms = []
+    ae_label_syms = []
+    se_offset_map = {}
+    ae_offset_map = {}
+    static_methods = set()
+
+    for version, is_ae in (('se', False), ('ae', True)):
+        cfg = VERSIONS[version]
+        parse_args = PARSE_ARGS_BASE + cfg['defines']
+        print('\n--- {} relocation scan ---'.format(version.upper()))
+        idx = ci.Index.create()
+        tu = idx.parse(SKYRIM_H, args=parse_args, options=PARSE_OPTIONS_FULL)
+        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
+        if errors:
+            print('  Parse errors ({} total, showing first 3):'.format(len(errors)))
+            for e in errors[:3]:
+                print('  ', e.spelling)
+        fs, ls, off_map, sm = _collect_relocations_from_tu(tu, addr_lib, is_ae)
+        static_methods |= sm  # union of SE and AE static methods (same headers)
+        if is_ae:
+            ae_func_syms, ae_label_syms, ae_offset_map = fs, ls, off_map
+        else:
+            se_func_syms, se_label_syms, se_offset_map = fs, ls, off_map
+
+    # Parse src/ cpp files via libclang (unity build) for functions not in Skyrim.h
+    src_dir = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibSSE', 'src')
+    if os.path.isdir(src_dir):
+        src_func_syms = _collect_src_relocations(
+            src_dir, addr_lib, se_offset_map, ae_offset_map)
+    else:
+        src_func_syms = []
+        print('  src/ dir not found, skipping')
+
+    # Merge RTTI/VTABLE labels — combine SE and AE offsets by name
+    label_by_name = {}
+    for lbl in se_label_syms:
+        label_by_name.setdefault(lbl['name'], {'name': lbl['name'], 'se_off': None, 'ae_off': None})
+        label_by_name[lbl['name']]['se_off'] = lbl['se_off']
+    for lbl in ae_label_syms:
+        label_by_name.setdefault(lbl['name'], {'name': lbl['name'], 'se_off': None, 'ae_off': None})
+        label_by_name[lbl['name']]['ae_off'] = lbl['ae_off']
+
+    # AE parse gives both IDs for functions; SE parse also yields any SE-only functions
+    # Merge: prefer AE entries (have both IDs); add SE-only if not covered
+    seen_se = set(fs['se_off'] for fs in ae_func_syms if fs['se_off'])
+    seen_ae = set(fs['ae_off'] for fs in ae_func_syms if fs['ae_off'])
+    merged_funcs = list(ae_func_syms)
+    for fs in se_func_syms:
+        if fs['se_off'] and fs['se_off'] not in seen_se:
+            seen_se.add(fs['se_off'])
+            merged_funcs.append(fs)
+    # Add src/ symbols not already found via headers
+    for fs in src_func_syms:
+        se_off = fs.get('se_off')
+        ae_off = fs.get('ae_off')
+        if se_off and se_off in seen_se:
+            continue
+        if ae_off and ae_off in seen_ae:
+            continue
+        if se_off: seen_se.add(se_off)
+        if ae_off: seen_ae.add(ae_off)
+        merged_funcs.append(fs)
+
+    # Build SYMBOLS array
+    symbols = []
+    sym_seen_se = set()
+    sym_seen_ae = set()
+
+    # Function symbols
+    for fs in merged_funcs:
+        full_name = '{}::{}'.format(fs['class_'], fs['name']) if fs['class_'] else fs['name']
+        sig = ''
+        if fs.get('ret'):
+            sig = '{}({})'.format(fs['ret'], fs.get('params', ''))
+            if fs.get('is_static'):
+                sig = 'static ' + sig
+        sym = {'n': full_name, 't': 'func', 'sig': sig, 'src': 'CommonLibSSE'}
+        if fs['se_off']: sym['s'] = fs['se_off']; sym_seen_se.add(fs['se_off'])
+        if fs['ae_off']: sym['a'] = fs['ae_off']; sym_seen_ae.add(fs['ae_off'])
+        symbols.append(sym)
+
+    # RTTI/VTABLE labels
+    for lbl in label_by_name.values():
+        sym = {'n': lbl['name'], 't': 'label', 'sig': '', 'src': 'CommonLibSSE'}
+        if lbl['se_off']: sym['s'] = lbl['se_off']; sym_seen_se.add(lbl['se_off'])
+        if lbl['ae_off']: sym['a'] = lbl['ae_off']; sym_seen_ae.add(lbl['ae_off'])
+        symbols.append(sym)
+
+    # AE rename database fallback
+    rename_db = os.path.join(SCRIPT_DIR, 'extern', 'AddressLibraryDatabase', 'skyrimae.rename')
+    ae_rename = extract_signatures.load_ae_rename_db(rename_db, addr_lib.ae_db)
+    rename_added = 0
+    names_with_ae = set(s['n'] for s in symbols if s.get('a'))
+    for ae_off, name in ae_rename.items():
+        if ae_off in sym_seen_ae:
+            continue
+        sym_seen_ae.add(ae_off)
+        if name in names_with_ae:
+            continue
+        names_with_ae.add(name)
+        symbols.append({'n': name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'})
+        rename_added += 1
+    print('\nAdded {} symbols from AE rename database'.format(rename_added))
+
+    pdb_added = 0
+    print('Added {} symbols from SE PDB (disabled)'.format(pdb_added))
+
+    # Normalize __ → :: in all names
+    for s in symbols:
+        if '__' in s['n']:
+            s['n'] = re.sub(r':{3,}', '::', s['n'].replace('__', '::'))
+
+    funcs = [s for s in symbols if s['t'] == 'func']
+    with_sig = len([s for s in funcs if s.get('sig')])
+    labels_count = len([s for s in symbols if s['t'] == 'label'])
+    print('\nGenerated {} symbols:'.format(len(symbols)))
+    print('  Functions: {} ({} with signatures)'.format(len(funcs), with_sig))
+    print('  Labels: {}'.format(labels_count))
+
     symbols_json = _json.dumps(symbols, separators=(',', ':'))
-    print('Generated {} symbols'.format(len(symbols)))
 
     for version in ('se', 'ae'):
         run_version(version, symbols_json)
