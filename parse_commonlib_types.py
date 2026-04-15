@@ -49,10 +49,13 @@ MISSING DEPENDENCY: binary_io
 
 STRUCT FIELD SIZES — PDB cross-reference
   PDB type info is loaded via DIA SDK (COM) or a manual TPI stream parser.
-  ~300 structs per version show a size mismatch between the PDB and libclang;
-  these are kept with libclang's field layout and flagged internally.  If the
-  PDB is absent, all struct sizes fall back to libclang's sizeof estimate, which
-  may be incorrect for types with compiler-specific padding or #pragma pack.
+  Two classes have a genuine size disagreement between libclang and the PDB
+  and are kept with libclang's layout (PDB data ignored for those types):
+    RE::AttackAnimationArrayMap  libclang=16  PDB=64
+    RE::bhkTelekinesisListener   libclang=8   PDB=16
+  If the PDB is absent, all struct sizes fall back to libclang's sizeof
+  estimate, which may be incorrect for types with compiler-specific padding
+  or #pragma pack.
 
 VTABLE SLOT COMPUTATION
   Vtable slot indices are computed from the libclang AST by counting virtual
@@ -1545,8 +1548,16 @@ def _merge_pdb_into_structs(structs, pdb_types):
                     existing = clang_field_map[pdb_foff]['name']
                     if not existing:
                         clang_field_map[pdb_foff]['name'] = pdb_fname
+
+        elif clang['size'] == 1 and pdb_sz == 1:
+            # Both sides report size 1: forward declaration, empty tag struct, or enum.
+            # No field data on either side; nothing to merge.
+            pass
+
         else:
+            # Genuine layout disagreement — both sides have a non-trivial size but disagree.
             size_mismatch += 1
+            print('  SIZE MISMATCH: {} clang={} pdb={}'.format(pdb_name, clang['size'], pdb_sz))
 
     print('PDB cross-reference: {} matched, {} size-ok, {} supplemented, {} mismatched'.format(
         matched, size_ok, supplemented, size_mismatch))
