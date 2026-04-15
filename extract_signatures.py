@@ -900,9 +900,20 @@ def generate_symbols(base_dir):
 
     # Fallback: add names from SE PDB for any SE addresses not yet covered.
     # Treated independently from AE rename — same name can appear in both versions.
-    # DISABLED: se_pdb_path = os.path.join(base_dir, 'pdbs', 'SkyrimSE.pdb')
+    se_pdb_path = os.path.join(base_dir, 'pdbs', 'SkyrimSE.pdb')
+    se_pdb = load_se_pdb_names(se_pdb_path)
+    print(f"Loaded {len(se_pdb)} public function symbols from SE PDB")
     pdb_added = 0
-    print(f"Added {pdb_added} symbols from SE PDB (disabled)")
+    for se_off, name in se_pdb.items():
+        if se_off in seen_offsets_se:
+            continue
+        seen_offsets_se.add(se_off)
+        if name in name_counts_se:
+            continue  # Name already has an SE address from a higher-priority source
+        name_counts_se[name] = 1
+        symbols.append({'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'})
+        pdb_added += 1
+    print(f"Added {pdb_added} symbols from SE PDB")
 
     # Normalize __ -> :: in all symbol names
     for s in symbols:

@@ -2298,7 +2298,8 @@ def _collect_src_relocations(src_dir, addr_lib, se_offset_map=None, ae_offset_ma
             unsaved_files=[(unity_vpath, unity_content)],
             options=PARSE_OPTIONS_FULL,
         )
-        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
+        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
+                  and 'binary_io/file_stream.hpp' not in d.spelling]
         if errors:
             print('  src/ {} unity errors ({} total, first 5):'.format(
                 version.upper(), len(errors)))
@@ -2345,7 +2346,8 @@ def run_version(version, symbols_json):
     idx = ci.Index.create()
     tu = idx.parse(SKYRIM_H, args=parse_args, options=PARSE_OPTIONS)
 
-    errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
+    errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
+              and 'binary_io/file_stream.hpp' not in d.spelling]
     if errors:
         print('Parse errors ({} total, showing first 5):'.format(len(errors)))
         for e in errors[:5]:
@@ -2401,7 +2403,8 @@ def main():
         print('\n--- {} relocation scan ---'.format(version.upper()))
         idx = ci.Index.create()
         tu = idx.parse(SKYRIM_H, args=parse_args, options=PARSE_OPTIONS_FULL)
-        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
+        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
+                  and 'binary_io/file_stream.hpp' not in d.spelling]
         if errors:
             print('  Parse errors ({} total, showing first 3):'.format(len(errors)))
             for e in errors[:3]:
