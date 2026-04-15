@@ -498,8 +498,16 @@ def _map_type(typ, depth=0):
     if kind == ci.TypeKind.INCOMPLETEARRAY:
         return 'ptr'
 
-    # Fallback: use size
+    # Fallback: use size.
+    # For integer-sized types (1/2/4/8 bytes) that libclang gave an UNEXPOSED kind
+    # (common for MSVC typedef'd integer types like std::int32_t), map to the
+    # appropriate signed integer descriptor rather than raw bytes so vtable
+    # parameter types resolve correctly in Ghidra.
     sz = typ.get_size()
+    if sz == 1: return 'i8'
+    if sz == 2: return 'i16'
+    if sz == 4: return 'i32'
+    if sz == 8: return 'i64'
     if sz > 0:
         return 'bytes:' + str(sz)
     return 'ptr'
@@ -794,6 +802,10 @@ def resolve_type(type_str):
     if type_str.startswith('ptr'): return _PTR
     if type_str.startswith('bytes:'):
         n = int(type_str[6:])
+        if n == 1: return _BYTE
+        if n == 2: return _I16
+        if n == 4: return _I32
+        if n == 8: return _I64
         return ArrayDataType(_BYTE, n, 1) if n > 1 else _BYTE
     if type_str.startswith('arr:'):
         rest = type_str[4:]
