@@ -211,7 +211,11 @@ def _load_pdb_types_dia(pdb_path):
             for fsym in _dia_iter(sym.findChildren(_SymTagData, None, 0)):
                 try:
                     if fsym.locationType == _LocIsThisRel:
-                        fields.append((fsym.name, fsym.offset))
+                        try:
+                            type_name = fsym.type.name or ''
+                        except Exception:
+                            type_name = ''
+                        fields.append((fsym.name, fsym.offset, type_name))
                 except Exception:
                     pass
         except Exception:
@@ -1337,6 +1341,13 @@ def _merge_pdb_into_structs(structs, pdb_types):
     """
     matched = size_ok = size_mismatch = supplemented = 0
 
+    # Build short-name → struct entry map for field type inference in PDB-supplemented structs
+    structs_by_short = {}
+    for st in structs.values():
+        short = st['name']
+        if short not in structs_by_short or structs_by_short[short]['size'] > 1:
+            structs_by_short[short] = st
+
     for pdb_name, pdb_info in pdb_types.items():
         short = pdb_name.split('::')[-1]
         clang_key = pdb_name if pdb_name in structs else short if short in structs else None
@@ -1354,9 +1365,10 @@ def _merge_pdb_into_structs(structs, pdb_types):
         clang['vfuncs'] = pdb_info.get('vfuncs', [])
 
         if clang['size'] == 1 and pdb_sz > 1:
-            # libclang got an incomplete layout; use PDB size + own fields
+            # libclang got an incomplete layout; use PDB size + own fields.
+            # Pass structs_by_short so field types can be inferred from known struct sizes.
             clang['size'] = pdb_sz
-            clang['fields'] = _pdb_fields_to_clang(pdb_fields, pdb_sz)
+            clang['fields'] = _pdb_fields_to_clang(pdb_fields, pdb_sz, structs_by_short)
             supplemented += 1
 
         elif clang['size'] == pdb_sz and pdb_sz > 1:
@@ -1365,7 +1377,8 @@ def _merge_pdb_into_structs(structs, pdb_types):
             # libclang names come directly from C++ source so they always take priority; PDB is
             # a fallback for offsets libclang couldn't resolve.
             clang_field_map = {f['offset']: f for f in clang['fields']}
-            for pdb_fname, pdb_foff in pdb_fields:
+            for entry in pdb_fields:
+                pdb_fname, pdb_foff = entry[0], entry[1]
                 if pdb_foff in clang_field_map:
                     existing = clang_field_map[pdb_foff]['name']
                     if not existing:
@@ -1377,13 +1390,19 @@ def _merge_pdb_into_structs(structs, pdb_types):
         matched, size_ok, supplemented, size_mismatch))
 
 
-def _pdb_fields_to_clang(pdb_fields, total_size):
-    """Convert [(name, offset)] from PDB into our field format, computing sizes from gaps."""
+def _pdb_fields_to_clang(pdb_fields, total_size, structs_by_short=None):
+    """Convert [(name, offset, pdb_type_name)] from PDB into our field format.
+
+    Uses pdb_type_name (from DIA fsym.type.name) to infer the struct type where possible,
+    falling back to structs_by_short size-matching, then bytes:N.
+    """
     if not pdb_fields:
         return []
     sorted_fields = sorted(pdb_fields, key=lambda x: x[1])
     result = []
-    for i, (name, off) in enumerate(sorted_fields):
+    for i, entry in enumerate(sorted_fields):
+        name, off = entry[0], entry[1]
+        pdb_type_name = entry[2] if len(entry) > 2 else ''
         if i + 1 < len(sorted_fields):
             next_off = sorted_fields[i + 1][1]
         else:
@@ -1391,9 +1410,26 @@ def _pdb_fields_to_clang(pdb_fields, total_size):
         fsize = next_off - off
         if fsize <= 0:
             continue
+
+        ftype = 'bytes:{}'.format(fsize)
+
+        # Priority 1: use PDB type name if it refers to a known struct/enum
+        if pdb_type_name and structs_by_short:
+            short = pdb_type_name.split('::')[-1].strip()
+            if short in structs_by_short:
+                cand = structs_by_short[short]
+                if cand['size'] == fsize:
+                    ftype = 'struct:' + cand['full_name']
+
+        # Priority 2: field name matches a known struct of the right size
+        if ftype.startswith('bytes:') and structs_by_short and name in structs_by_short:
+            cand = structs_by_short[name]
+            if cand['size'] == fsize:
+                ftype = 'struct:' + cand['full_name']
+
         result.append({
             'name': name,
-            'type': 'bytes:{}'.format(fsize),
+            'type': ftype,
             'offset': off,
             'size': fsize,
         })
