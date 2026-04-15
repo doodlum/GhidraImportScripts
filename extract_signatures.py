@@ -401,8 +401,9 @@ def parse_offsets_rtti_vtable(file_path, addr_lib):
         # Pattern 2: REL::ID Name{ ID };  (AE RTTI format, bare int)
         for m in re.finditer(r'REL::ID\s+((?:RTTI|VTABLE)_\w+)\s*\{\s*(\d+)\s*\}', text):
             db[m.group(1)] = int(m.group(2))
-        # Pattern 3: std::array<REL::ID, N> VTABLE_Name{ REL::ID(ID) };  (VTABLE format)
-        for m in re.finditer(r'std::array<REL::ID,\s*\d+>\s+(VTABLE_\w+)\s*\{\s*REL::ID\((\d+)\)\s*\}', text):
+        # Pattern 3: std::array<REL::ID, N> VTABLE_Name{ REL::ID(ID), ... };  (VTABLE format)
+        # Captures only the first ID (primary vtable); arrays may have multiple entries for MI.
+        for m in re.finditer(r'std::array<REL::ID,\s*\d+>\s+(VTABLE_\w+)\s*\{\s*REL::ID\((\d+)\)', text):
             db[m.group(1)] = int(m.group(2))
         return db
 
@@ -675,8 +676,12 @@ def load_ae_rename_db(file_path, ae_db):
     return result
 
 
-def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+def generate_symbols(base_dir):
+    """Generate the SYMBOLS list from CommonLibSSE sources and address databases.
+
+    Returns list of symbol dicts: {n, t, sig, s?, a?, src}.
+    Can be called from other scripts to avoid re-running extraction.
+    """
     commonlib_dir = os.path.join(base_dir, 'extern', 'CommonLibSSE')
     assert os.path.exists(commonlib_dir), f"CommonLibSSE not found at {commonlib_dir}"
 
@@ -895,20 +900,9 @@ def main():
 
     # Fallback: add names from SE PDB for any SE addresses not yet covered.
     # Treated independently from AE rename — same name can appear in both versions.
-    se_pdb_path = os.path.join(base_dir, 'pdbs', 'SkyrimSE.pdb')
-    se_pdb = load_se_pdb_names(se_pdb_path)
-    print(f"Loaded {len(se_pdb)} public function symbols from SE PDB")
+    # DISABLED: se_pdb_path = os.path.join(base_dir, 'pdbs', 'SkyrimSE.pdb')
     pdb_added = 0
-    for se_off, name in se_pdb.items():
-        if se_off in seen_offsets_se:
-            continue
-        seen_offsets_se.add(se_off)
-        if name in name_counts_se:
-            continue  # Name already has an SE address from a higher-priority source
-        name_counts_se[name] = 1
-        symbols.append({'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'})
-        pdb_added += 1
-    print(f"Added {pdb_added} symbols from SE PDB")
+    print(f"Added {pdb_added} symbols from SE PDB (disabled)")
 
     # Normalize __ -> :: in all symbol names
     for s in symbols:
@@ -925,22 +919,18 @@ def main():
     print(f"  Functions: {len(funcs)} ({with_sig} with signatures)")
     print(f"  Labels: {labels}")
 
-    # Enums are already defined in the PDB, so we skip enum extraction
-    enums = []
+    return symbols
 
-    # Write CommonLibGhidra.py
-    output_path = os.path.join(base_dir, 'ghidrascripts', 'CommonLibGhidra.py')
 
-    # Read the template (Ghidra script code)
-    template_path = os.path.join(base_dir, 'ghidra_script_template.py')
+def main():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    symbols = generate_symbols(base_dir)
 
-    # Generate the script inline
     symbols_json = json.dumps(symbols, separators=(',', ':'))
-    enums_json = json.dumps(enums, separators=(',', ':'))
-
-    # Read the Ghidra script template
+    enums_json = json.dumps([], separators=(',', ':'))
     ghidra_code = generate_ghidra_script()
 
+    output_path = os.path.join(base_dir, 'ghidrascripts', 'CommonLibGhidra.py')
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(ghidra_code)
         f.write(f"\nSYMBOLS = {symbols_json}\n")
@@ -948,7 +938,7 @@ def main():
         f.write("\nif __name__ == '__main__':\n    run()\n")
 
     print(f"\nWrote {output_path}")
-    print(f"  {len(symbols)} symbols, {len(enums)} enums")
+    print(f"  {len(symbols)} symbols")
 
 
 def generate_ghidra_script():
