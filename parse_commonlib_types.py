@@ -27,12 +27,25 @@ FUNCTION SIGNATURES — Offset:: namespace
   exotic initialisers (nested templates, macros that expand to Offset references)
   are silently skipped.
 
-MISSING FUNCTIONS (~25 out of ~1000)
-  A small number of functions in the Skyrim.h header parse are absent because:
-    - Their REL::Relocation<> specialisation uses a type not visible at parse time.
-    - The enclosing class is itself a template that libclang does not instantiate.
-  These are not recovered by any fallback; they must be added manually or found
-  via the AE rename database / SE PDB if available.
+MISSING FUNCTIONS (5 out of ~1000)
+  Five REL::Relocation<> sites are not captured:
+
+  BSPointerHandleManager::GetHandleEntries (BSPointerHandleManager.h line 30)
+    Type is 'REL::Relocation<Entry(*)[0x100000]>'.  The integer 0x100000 (array
+    bound in the template type argument) is found first by the AST literal
+    scanner, shadowing the real RELOCATION_ID(514478, 400622).  The token-stream
+    fallback is not attempted because get_int_literals already returned a value.
+    Root cause: get_int_literals does not skip INTEGER_LITERALs inside template
+    type arguments.
+
+  RTTI::from, RTTI::to (RE/RTTI.h lines 228-229)
+  NiObjectNET::rtti (RE/N/NiObjectNET.h line 67)
+  NiRTTI::to (RE/N/NiRTTI.h line 103)
+    All four live inside template functions where the REL::Relocation<> is
+    initialised with a static member of a template type parameter
+    (e.g. 'remove_cvpr_t<From>::RTTI', 'T::Ni_RTTI').  There is no integer
+    RELOCATION_ID present — the address depends entirely on which type the
+    template is instantiated with.  Unresolvable without template instantiation.
 
 STATIC METHOD DETECTION
   'static' is inferred from the libclang AST when a CXX_METHOD is marked
@@ -1869,7 +1882,8 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
         Finds the var name in the token list then reads numeric tokens after '{'.
         """
         tokens = [t.spelling for t in parent_cursor.get_tokens()]
-        # Find the last occurrence of the variable name to locate the initializer
+        # Find the last occurrence of the variable name to locate the initializer.
+        # (Using last-occurrence avoids matching an outer-scope var with the same name.)
         try:
             var_idx = len(tokens) - 1 - tokens[::-1].index(var_name)
         except ValueError:
@@ -2070,7 +2084,7 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
             type_sp = cursor.type.spelling
 
             if 'REL::Relocation<' in type_sp:
-                # Try AST integer literal children first (works for some namespace-level vars)
+                # Try AST integer literal children first (works for most vars)
                 ids = get_int_literals(cursor)
                 # Fallback: read the parent DECL_STMT's token stream
                 # (libclang doesn't expose static local initializers as VAR_DECL children)
@@ -2093,6 +2107,13 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
 
                 se_off = addr_lib.se_db.get(se_id) if se_id else None
                 ae_off = addr_lib.ae_db.get(ae_id) if ae_id else None
+
+                if not se_off and not ae_off and not is_ae:
+                    f = cursor.location.file
+                    fname_short = os.path.basename(f.name) if f else '?'
+                    sym = (enc_name or var_name)
+                    cls = enc_class or ''
+                    _missed_relocs.append((fname_short, cursor.location.line, cls, sym, se_id, ae_id))
 
                 if se_off or ae_off:
                     if enc_name and enc_name.lower() not in _GENERIC_VAR_NAMES:
@@ -2192,7 +2213,14 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
         for c in cursor.get_children():
             walk(c, cursor, enc_name, enc_class, enc_ret, enc_params, enc_static, depth + 1)
 
+    _missed_relocs = []
     walk(tu.cursor)
+
+    if not is_ae and _missed_relocs:
+        print('  Missed REL::Relocation<> VAR_DECLs (no address resolved):')
+        for fname_short, line, cls, sym, se_id, ae_id in sorted(_missed_relocs):
+            id_str = 'se_id={} ae_id={}'.format(se_id, ae_id)
+            print('    {}:{} {}::{} ({})'.format(fname_short, line, cls, sym, id_str))
 
     # Collect static method declarations from header AST so _scan_src_files can
     # correctly mark static methods even when their .cpp definition lacks 'static'.
