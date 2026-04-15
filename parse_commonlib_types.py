@@ -1081,10 +1081,15 @@ def _import_symbols():
             symbol_table.createLabel(addr, final_name, SourceType.USER_DEFINED)
             used_names_at_addr[addr].add(sname)
             count_sym += 1
-            if s.get('src') and s['t'] == 'label':
+            if s['t'] == 'label':
                 cu = currentProgram.getListing().getCodeUnitAt(addr)
                 if cu:
-                    cu.setComment(0, 'Source: ' + s['src'])
+                    if final_name.startswith('RTTI_'):
+                        cu.setComment(0, 'Source: CommonLibSSE (Offsets_RTTI.h)')
+                    elif final_name.startswith('VTABLE_'):
+                        cu.setComment(0, 'Source: CommonLibSSE (Offsets_VTABLE.h)')
+                    elif s.get('src'):
+                        cu.setComment(0, 'Source: ' + s['src'])
         except: pass
 
         if s['t'] == 'func':
@@ -1109,9 +1114,13 @@ def _import_symbols():
                         comment_parts.append('REL::ID(' + str(se_id) + ')')
                     elif ae_id:
                         comment_parts.append('REL::ID(' + str(ae_id) + ')')
-                    # Only annotate source for CommonLibSSE symbols; PDB/rename are fallbacks only
-                    if s.get('src') == 'CommonLibSSE':
-                        comment_parts.append('Source: CommonLibSSE')
+                    src = s.get('src', '')
+                    if src == 'CommonLibSSE':
+                        comment_parts.append('Source: CommonLibSSE headers')
+                    elif src == 'skyrimae.rename':
+                        comment_parts.append('Source: AE rename database (fallback)')
+                    elif src == 'SkyrimSE.pdb':
+                        comment_parts.append('Source: SkyrimSE.pdb public symbols (fallback)')
                     if comment_parts:
                         cu = currentProgram.getListing().getCodeUnitAt(addr)
                         if cu:
@@ -1219,7 +1228,11 @@ def _import_vtable_names():
                         func.setName(class_short + '::' + slot_name, SourceType.USER_DEFINED)
                         cu = currentProgram.getListing().getCodeUnitAt(func_addr)
                         if cu:
-                            cu.setComment(0, 'VTABLE ' + class_full_name + ' +0x{:X}'.format(slot_off))
+                            cu.setComment(0, (
+                                'VTABLE ' + class_full_name + '::' + slot_name + '\\n' +
+                                'Slot offset: +0x{:X}\\n'.format(slot_off) +
+                                'Source: CommonLibSSE vtable walk'
+                            ))
                         if slot_ret is not None and slot_params is not None:
                             try:
                                 param_parts = [class_short + ' * this']
