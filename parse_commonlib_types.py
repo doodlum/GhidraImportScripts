@@ -10,8 +10,7 @@ Run with: py -3.13 parse_commonlib_types.py
 import os
 import sys
 import re
-import struct
-import math
+import glob
 
 # ---------------------------------------------------------------------------
 # libclang setup
@@ -59,239 +58,197 @@ OUTPUT_SCRIPT = os.path.join(OUTPUT_DIR, 'CommonLibTypes.py')
 PDB_SE_PATH = os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_SE_D.pdb')
 
 # ---------------------------------------------------------------------------
-# PDB TPI parser — extracts RE:: struct layouts (field names + byte offsets)
+# PDB parser — DIA SDK via COM (primary), manual TPI stream (fallback)
 # ---------------------------------------------------------------------------
 
-def _pdb_read_numeric(data, pos):
-    val = struct.unpack_from('<H', data, pos)[0]
-    if val < 0x8000: return val, pos + 2
-    if val == 0x8000: return struct.unpack_from('<b',  data, pos+2)[0], pos + 3
-    if val == 0x8001: return struct.unpack_from('<h',  data, pos+2)[0], pos + 4
-    if val == 0x8002: return struct.unpack_from('<H',  data, pos+2)[0], pos + 4
-    if val == 0x8003: return struct.unpack_from('<i',  data, pos+2)[0], pos + 6
-    if val == 0x8004: return struct.unpack_from('<I',  data, pos+2)[0], pos + 6
-    if val == 0x8009: return struct.unpack_from('<q',  data, pos+2)[0], pos + 10
-    if val == 0x800a: return struct.unpack_from('<Q',  data, pos+2)[0], pos + 10
-    return 0, pos + 2
+# SymTag and LocType constants from dia2.h
+_SymTagData      = 7
+_SymTagFunction  = 5
+_SymTagUDT       = 11
+_SymTagBaseClass = 18
+_LocIsThisRel    = 4
 
-def _pdb_read_cstr(data, pos):
-    end = data.index(b'\x00', pos)
-    return data[pos:end].decode('utf-8', errors='replace'), end + 1
 
-def _pdb_read_stream(data, page_size, stream_pages, sizes, idx):
-    if idx >= len(sizes) or sizes[idx] == 0xFFFFFFFF:
-        return b''
-    buf = bytearray()
-    for pg in stream_pages[idx]:
-        buf += data[pg * page_size : (pg + 1) * page_size]
-    return bytes(buf[:sizes[idx]])
+def _find_msdia_dll():
+    """Locate msdia140.dll — checks VS, PIX, and the registry CLSID path."""
+    # Check registry first: DIA registers its DLL path under its CLSID
+    try:
+        import winreg
+        clsid = '{E6756135-1E65-4D17-8576-610761398C3C}'
+        key_path = r'CLSID\{}\InprocServer32'.format(clsid)
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key_path) as k:
+            path, _ = winreg.QueryValueEx(k, '')
+            if path and os.path.isfile(path):
+                return path
+    except OSError:
+        pass
 
-def _pdb_parse_msf(data):
-    page_size = struct.unpack_from('<I', data, 32)[0]
-    dir_size  = struct.unpack_from('<I', data, 44)[0]
-    blk_map   = struct.unpack_from('<I', data, 52)[0]
-    n_blk     = math.ceil(dir_size / page_size)
-    dir_data  = bytearray()
-    for i in range(n_blk):
-        pg = struct.unpack_from('<I', data, blk_map * page_size + i * 4)[0]
-        dir_data += data[pg * page_size : (pg + 1) * page_size]
-    dir_data = bytes(dir_data[:dir_size])
-    n_streams = struct.unpack_from('<I', dir_data, 0)[0]
-    sizes = [struct.unpack_from('<I', dir_data, 4 + i*4)[0] for i in range(n_streams)]
-    stream_pages = []
-    off = 4 + n_streams * 4
-    for sz in sizes:
-        n = math.ceil(sz / page_size) if sz != 0xFFFFFFFF else 0
-        pages = [struct.unpack_from('<I', dir_data, off + i*4)[0] for i in range(n)]
-        stream_pages.append(pages)
-        off += n * 4
-    return page_size, sizes, stream_pages
+    # Glob common install locations (VS DIA SDK, PIX, WinSDK)
+    patterns = [
+        r'C:\Program Files\Microsoft Visual Studio\*\*\DIA SDK\bin\amd64\msdia140.dll',
+        r'C:\Program Files (x86)\Microsoft Visual Studio\*\*\DIA SDK\bin\amd64\msdia140.dll',
+        r'C:\Program Files\Microsoft Visual Studio\*\*\DIA SDK\bin\msdia140.dll',
+        r'C:\Program Files (x86)\Microsoft Visual Studio\*\*\DIA SDK\bin\msdia140.dll',
+        r'C:\Program Files\Microsoft PIX\*\msdia140.dll',
+        r'C:\Program Files (x86)\Microsoft PIX\*\msdia140.dll',
+    ]
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        if matches:
+            # Prefer amd64 / non-ARM builds
+            amd = [m for m in matches if 'arm' not in m.lower() and 'x86' not in m.lower()]
+            return (amd or matches)[0]
+    return None
 
-# CodeView leaf type constants
-_LF_FIELDLIST  = 0x1203
-_LF_BCLASS     = 0x1400
-_LF_VBCLASS    = 0x1401
-_LF_IVBCLASS   = 0x1402
-_LF_INDEX      = 0x1404
-_LF_VFUNCTAB   = 0x1409
-_LF_ENUMERATE  = 0x1502
-_LF_STRUCTURE  = 0x1505
-_LF_CLASS      = 0x1504
-_LF_MEMBER     = 0x150d
-_LF_STMEMBER   = 0x150e
-_LF_METHOD     = 0x150f
-_LF_NESTTYPE   = 0x1510
-_LF_ONEMETHOD  = 0x1511
-_CV_fwdref     = 0x0080
+
+def _dia_iter(enum):
+    """Yield IDiaSymbol objects from an IDiaEnumSymbols one at a time."""
+    while True:
+        try:
+            result = enum.Next(1)
+        except Exception:
+            break
+        # comtypes maps Next(celt) → (rgelt, pceltFetched)
+        try:
+            syms, count = result
+        except (TypeError, ValueError):
+            break
+        if not count:
+            break
+        # rgelt is a single IDiaSymbol when celt=1
+        yield syms[0] if isinstance(syms, (list, tuple)) else syms
+
+
+def _load_pdb_types_dia(pdb_path):
+    """Read RE:: struct layouts from a PDB using the DIA SDK COM interface."""
+    import ctypes
+    import logging
+    import comtypes
+    import comtypes.client
+
+    msdia_path = _find_msdia_dll()
+    if not msdia_path:
+        raise RuntimeError('msdia140.dll not found in VS installation')
+
+    # Suppress "Generating comtypes.gen.*" noise
+    for log_name in ('comtypes.client._code_cache', 'comtypes.client._generate'):
+        logging.getLogger(log_name).setLevel(logging.WARNING)
+
+    dia = comtypes.client.GetModule(msdia_path)
+
+    # Create IDiaDataSource — try registered COM first, then DllGetClassObject
+    clsid = dia.DiaSource._reg_clsid_
+    iface = dia.IDiaDataSource
+    source = None
+
+    try:
+        source = comtypes.client.CreateObject(clsid, interface=iface)
+    except Exception:
+        pass
+
+    if source is None:
+        _dll = ctypes.WinDLL(msdia_path)
+        _dll.DllGetClassObject.restype = ctypes.HRESULT
+        IID_CF = comtypes.GUID('{00000001-0000-0000-C000-000000000046}')
+        cf_ptr = ctypes.c_void_p()
+        hr = _dll.DllGetClassObject(
+            ctypes.byref(clsid), ctypes.byref(IID_CF), ctypes.byref(cf_ptr)
+        )
+        if hr:
+            raise OSError('DllGetClassObject failed: {:#010x}'.format(hr & 0xFFFFFFFF))
+        # IClassFactory — define inline since comtypes doesn't expose it publicly
+        class IClassFactory(comtypes.IUnknown):
+            _iid_ = comtypes.GUID('{00000001-0000-0000-C000-000000000046}')
+            _methods_ = [
+                comtypes.COMMETHOD([], ctypes.HRESULT, 'CreateInstance',
+                    (['in'], ctypes.POINTER(comtypes.IUnknown), 'pUnkOuter'),
+                    (['in'], ctypes.POINTER(comtypes.GUID), 'riid'),
+                    (['out'], ctypes.POINTER(ctypes.c_void_p), 'ppvObject'),
+                ),
+                comtypes.COMMETHOD([], ctypes.HRESULT, 'LockServer',
+                    (['in'], ctypes.c_bool, 'fLock'),
+                ),
+            ]
+        # comtypes LP types proxy COM calls directly — no .contents needed
+        unk = ctypes.cast(cf_ptr, ctypes.POINTER(comtypes.IUnknown))
+        factory = unk.QueryInterface(IClassFactory)
+        ppv = factory.CreateInstance(None, ctypes.byref(iface._iid_))
+        source = ctypes.cast(ppv, ctypes.POINTER(iface))
+
+    source.loadDataFromPdb(pdb_path)
+    session = source.openSession()
+    scope = session.globalScope
+
+    result = {}
+
+    for sym in _dia_iter(scope.findChildren(_SymTagUDT, None, 0)):
+        try:
+            name = sym.name
+        except Exception:
+            continue
+        if not name or not name.startswith('RE::') or '<' in name:
+            continue
+        try:
+            size = sym.length
+        except Exception:
+            continue
+        if not size:
+            continue
+
+        fields = []
+        try:
+            for fsym in _dia_iter(sym.findChildren(_SymTagData, None, 0)):
+                try:
+                    if fsym.locationType == _LocIsThisRel:
+                        fields.append((fsym.name, fsym.offset))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        bases = []
+        try:
+            for bsym in _dia_iter(sym.findChildren(_SymTagBaseClass, None, 0)):
+                try:
+                    bases.append((bsym.type.name, bsym.offset))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        vfuncs = []
+        try:
+            for fsym in _dia_iter(sym.findChildren(_SymTagFunction, None, 0)):
+                try:
+                    if fsym.intro and fsym.virtual:
+                        voff = fsym.virtualBaseOffset
+                        fname = fsym.name
+                        if fname and '<' not in fname and 0 <= voff < 0x4000:
+                            vfuncs.append((fname, voff))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if name not in result:
+            result[name] = {
+                'size': size,
+                'fields': fields,
+                'bases': bases,
+                'vfuncs': vfuncs,
+            }
+
+    return result
+
 
 def load_pdb_types(pdb_path):
     """
-    Parse the TPI stream of a PDB file and return a dict:
-      { 'RE::StructName': {
-            'size': N,
-            'fields': [('name', byte_offset), ...],   # own members only
-            'bases':  [('RE::BaseName', base_offset), ...],  # direct bases + their offset
-        } }
-    Only includes non-forward-reference RE:: types with size > 0.
+    Extract RE:: struct layouts from a PDB file using DIA SDK via COM.
+    Returns: { 'RE::StructName': { 'size', 'fields', 'bases', 'vfuncs' } }
     """
     if not os.path.isfile(pdb_path):
         return {}
-
-    with open(pdb_path, 'rb') as f:
-        data = f.read()
-
-    if data[:8] != b'Microsof':
-        return {}
-
-    page_size, sizes, stream_pages = _pdb_parse_msf(data)
-    tpi = _pdb_read_stream(data, page_size, stream_pages, sizes, 2)
-    if len(tpi) < 56:
-        return {}
-
-    _, hdr_size, ti_min, ti_max = struct.unpack_from('<IIII', tpi, 0)
-
-    # Pass 1: build type index → byte offset map
-    ti_offsets = {}
-    pos = hdr_size
-    ti = ti_min
-    while pos + 4 <= len(tpi) and ti < ti_max:
-        rec_len = struct.unpack_from('<H', tpi, pos)[0]
-        if rec_len < 2:
-            break
-        ti_offsets[ti] = pos
-        ti += 1
-        pos = ((pos + 2 + rec_len) + 3) & ~3
-
-    # Pass 2: build type index → struct name (for resolving LF_BCLASS references)
-    ti_to_name = {}
-    pos = hdr_size
-    ti = ti_min
-    while pos + 4 <= len(tpi) and ti < ti_max:
-        rec_len = struct.unpack_from('<H', tpi, pos)[0]
-        if rec_len < 2:
-            break
-        leaf = struct.unpack_from('<H', tpi, pos + 2)[0]
-        if leaf in (_LF_STRUCTURE, _LF_CLASS):
-            p = pos + 4 + 16          # skip count/prop/field_ti/derived/vshape
-            _, p = _pdb_read_numeric(tpi, p)  # size
-            name, _ = _pdb_read_cstr(tpi, p)
-            if name and '<' not in name and '`' not in name:
-                ti_to_name[ti] = name
-        ti += 1
-        pos = ((pos + 2 + rec_len) + 3) & ~3
-
-    def parse_fieldlist(fl_ti):
-        """Return (members, bases, vfuncs) from an LF_FIELDLIST.
-        members: [(field_name, byte_offset)]
-        bases:   [(base_struct_name, byte_offset_within_derived)]
-        vfuncs:  [(method_name, vbaseoff)] — intro virtual methods only (mprop 4/5)
-        """
-        members = []
-        bases = []
-        vfuncs = []
-        seen = set()
-        queue = [fl_ti]
-        while queue:
-            cur = queue.pop(0)
-            if cur in seen or cur not in ti_offsets:
-                continue
-            seen.add(cur)
-            rpos = ti_offsets[cur]
-            rec_len = struct.unpack_from('<H', tpi, rpos)[0]
-            leaf = struct.unpack_from('<H', tpi, rpos + 2)[0]
-            if leaf != _LF_FIELDLIST:
-                continue
-            p = rpos + 4
-            end = rpos + 2 + rec_len
-            while p < end:
-                if p + 2 > end:
-                    break
-                if tpi[p] >= 0xF0:   # padding byte
-                    p += 1
-                    continue
-                fld = struct.unpack_from('<H', tpi, p)[0]
-                p += 2
-                try:
-                    if fld == _LF_MEMBER:
-                        _attr, _typ = struct.unpack_from('<HI', tpi, p); p += 6
-                        off, p = _pdb_read_numeric(tpi, p)
-                        name, p = _pdb_read_cstr(tpi, p)
-                        members.append((name, off))
-                    elif fld == _LF_BCLASS:
-                        _attr, btype_ti = struct.unpack_from('<HI', tpi, p); p += 6
-                        off, p = _pdb_read_numeric(tpi, p)
-                        base_name = ti_to_name.get(btype_ti, '')
-                        if base_name:
-                            bases.append((base_name, off))
-                    elif fld == _LF_STMEMBER:
-                        p += 2 + 4
-                        _, p = _pdb_read_cstr(tpi, p)
-                    elif fld == _LF_METHOD:
-                        p += 2 + 4
-                        _, p = _pdb_read_cstr(tpi, p)
-                    elif fld == _LF_ONEMETHOD:
-                        attr, _typ = struct.unpack_from('<HI', tpi, p); p += 6
-                        mprop = (attr >> 2) & 7
-                        vbaseoff = None
-                        if mprop in (4, 5):
-                            vbaseoff = struct.unpack_from('<i', tpi, p)[0]; p += 4
-                        name, p = _pdb_read_cstr(tpi, p)
-                        if vbaseoff is not None and name and '<' not in name and 0 <= vbaseoff < 0x4000:
-                            vfuncs.append((name, vbaseoff))
-                    elif fld == _LF_NESTTYPE:
-                        p += 2 + 4
-                        _, p = _pdb_read_cstr(tpi, p)
-                    elif fld in (_LF_VBCLASS, _LF_IVBCLASS):
-                        p += 2 + 4 + 4
-                        _, p = _pdb_read_numeric(tpi, p)
-                        _, p = _pdb_read_numeric(tpi, p)
-                    elif fld == _LF_VFUNCTAB:
-                        p += 2 + 4
-                    elif fld == _LF_ENUMERATE:
-                        p += 2
-                        _, p = _pdb_read_numeric(tpi, p)
-                        _, p = _pdb_read_cstr(tpi, p)
-                    elif fld == _LF_INDEX:
-                        p += 2
-                        cont = struct.unpack_from('<I', tpi, p)[0]; p += 4
-                        queue.append(cont)
-                    else:
-                        break
-                except Exception:
-                    break
-                p = (p + 3) & ~3
-        return members, bases, vfuncs
-
-    # Pass 3: collect all non-forward RE:: struct definitions
-    result = {}
-    pos = hdr_size
-    ti = ti_min
-    while pos + 4 <= len(tpi) and ti < ti_max:
-        rec_len = struct.unpack_from('<H', tpi, pos)[0]
-        if rec_len < 2:
-            break
-        leaf = struct.unpack_from('<H', tpi, pos + 2)[0]
-        if leaf in (_LF_STRUCTURE, _LF_CLASS):
-            p = pos + 4
-            _cnt, prop, field_ti, _der, _vsh = struct.unpack_from('<HHIII', tpi, p)
-            p += 16
-            sz, p = _pdb_read_numeric(tpi, p)
-            name, _ = _pdb_read_cstr(tpi, p)
-            is_fwd = bool(prop & _CV_fwdref)
-            if (not is_fwd and sz > 0 and field_ti
-                    and name.startswith('RE::') and '<' not in name):
-                if name not in result:
-                    members, bases, vfuncs = parse_fieldlist(field_ti)
-                    result[name] = {
-                        'size': sz,
-                        'fields': members,
-                        'bases': bases,   # [(base_name, base_offset)]
-                        'vfuncs': vfuncs, # [(method_name, vbaseoff)]
-                    }
-        ti += 1
-        pos = ((pos + 2 + rec_len) + 3) & ~3
-
-    return result
+    return _load_pdb_types_dia(pdb_path)
 
 PARSE_ARGS = [
     '-x', 'c++',
