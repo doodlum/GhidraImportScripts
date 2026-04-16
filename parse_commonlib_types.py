@@ -97,6 +97,9 @@ import os
 import sys
 import re
 import glob
+import struct
+import math
+import ctypes
 
 # ---------------------------------------------------------------------------
 # libclang setup
@@ -140,6 +143,230 @@ COMMONLIB_INCLUDE = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibSSE', 'include'
 SKYRIM_H = os.path.join(COMMONLIB_INCLUDE, 'RE', 'Skyrim.h')
 RE_INCLUDE = os.path.join(COMMONLIB_INCLUDE, 'RE')
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'ghidrascripts')
+EXTRA_TYPES_JSON = os.path.join(SCRIPT_DIR, 'extra_types.json')
+
+
+# ---------------------------------------------------------------------------
+# Address library / PDB / rename-DB utilities (inlined from extract_signatures)
+# ---------------------------------------------------------------------------
+
+class AddressLibrary:
+    """Loads address-library binary databases mapping RELOCATION_IDs to RVAs."""
+
+    def __init__(self):
+        self.se_db = {}
+        self.ae_db = {}
+
+    def load_bin(self, file_path):
+        if not os.path.exists(file_path):
+            return {}
+        db = {}
+        with open(file_path, 'rb') as f:
+            f.read(4)   # fmt
+            f.read(16)  # version
+            name_len = struct.unpack('<I', f.read(4))[0]
+            f.read(name_len)
+            ptr_size   = struct.unpack('<I', f.read(4))[0]
+            addr_count = struct.unpack('<I', f.read(4))[0]
+            pvid = 0; poffset = 0
+            for _ in range(addr_count):
+                type_byte = struct.unpack('<B', f.read(1))[0]
+                low = type_byte & 0xF; high = type_byte >> 4
+                if   low == 0: id_val = struct.unpack('<Q', f.read(8))[0]
+                elif low == 1: id_val = pvid + 1
+                elif low == 2: id_val = pvid + struct.unpack('<B', f.read(1))[0]
+                elif low == 3: id_val = pvid - struct.unpack('<B', f.read(1))[0]
+                elif low == 4: id_val = pvid + struct.unpack('<H', f.read(2))[0]
+                elif low == 5: id_val = pvid - struct.unpack('<H', f.read(2))[0]
+                elif low == 6: id_val = struct.unpack('<H', f.read(2))[0]
+                elif low == 7: id_val = struct.unpack('<I', f.read(4))[0]
+                tpoffset = (poffset // ptr_size) if (high & 8) != 0 else poffset
+                h_type = high & 7
+                if   h_type == 0: off_val = struct.unpack('<Q', f.read(8))[0]
+                elif h_type == 1: off_val = tpoffset + 1
+                elif h_type == 2: off_val = tpoffset + struct.unpack('<B', f.read(1))[0]
+                elif h_type == 3: off_val = tpoffset - struct.unpack('<B', f.read(1))[0]
+                elif h_type == 4: off_val = tpoffset + struct.unpack('<H', f.read(2))[0]
+                elif h_type == 5: off_val = tpoffset - struct.unpack('<H', f.read(2))[0]
+                elif h_type == 6: off_val = struct.unpack('<H', f.read(2))[0]
+                elif h_type == 7: off_val = struct.unpack('<I', f.read(4))[0]
+                if (high & 8) != 0: off_val *= ptr_size
+                db[id_val] = off_val; pvid = id_val; poffset = off_val
+        return db
+
+    def load_all(self, base_path):
+        self.se_db = self.load_bin(os.path.join(base_path, 'version-1-5-97-0.bin'))
+        self.ae_db = self.load_bin(os.path.join(base_path, 'versionlib-1-6-1170-0.bin'))
+
+
+def _undecorate(name):
+    """Demangle an MSVC-mangled symbol name using dbghelp.UnDecorateSymbolName."""
+    try:
+        buf = ctypes.create_string_buffer(512)
+        if ctypes.windll.dbghelp.UnDecorateSymbolName(name.encode(), buf, 512, 0x1000):
+            return buf.value.decode('ascii', errors='replace')
+    except Exception:
+        pass
+    return name
+
+
+def load_se_pdb_names(file_path):
+    """Parse a PDB (MSF7) file and return dict of rva -> name for all public function symbols."""
+    if not os.path.exists(file_path):
+        return {}
+
+    with open(file_path, 'rb') as f:
+        data = f.read()
+
+    if not data.startswith(b'Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00'):
+        return {}
+
+    # MSF superblock
+    page_size = struct.unpack_from('<I', data, 32)[0]
+    dir_size  = struct.unpack_from('<I', data, 44)[0]
+    blk_map   = struct.unpack_from('<I', data, 52)[0]
+
+    # Stream directory
+    n_dir_pages = math.ceil(dir_size / page_size)
+    dir_page_list = struct.unpack_from(f'<{n_dir_pages}I', data, blk_map * page_size)
+    dir_data = b''.join(data[p * page_size:(p + 1) * page_size] for p in dir_page_list)[:dir_size]
+
+    n_streams = struct.unpack_from('<I', dir_data, 0)[0]
+    sizes = struct.unpack_from(f'<{n_streams}I', dir_data, 4)
+
+    o = 4 + n_streams * 4
+    stream_pages = []
+    for sz in sizes:
+        if sz == 0 or sz == 0xFFFFFFFF:
+            stream_pages.append([])
+        else:
+            np = math.ceil(sz / page_size)
+            stream_pages.append(list(struct.unpack_from(f'<{np}I', dir_data, o)))
+            o += np * 4
+
+    def read_stream(idx):
+        if idx >= n_streams or sizes[idx] in (0, 0xFFFFFFFF):
+            return b''
+        return b''.join(data[p * page_size:(p + 1) * page_size] for p in stream_pages[idx])[:sizes[idx]]
+
+    # DBI stream (stream 3)
+    dbi = read_stream(3)
+    if len(dbi) < 64:
+        return {}
+
+    (_, _, _,
+     _, _,
+     _, _,
+     sym_rec_idx, _,
+     mod_sz, sec_contrib_sz, sec_map_sz, src_sz, type_srv_sz, _,
+     opt_dbg_sz, ec_sz,
+     _, _, _) = struct.unpack_from('<iIIHHHHHHiiiiiIiiHHI', dbi)
+
+    # Section headers stream index (offset 10 within optional debug header)
+    opt_off = 64 + mod_sz + sec_contrib_sz + sec_map_sz + src_sz + type_srv_sz + ec_sz
+    sec_hdr_idx = struct.unpack_from('<H', dbi, opt_off + 10)[0] if opt_dbg_sz >= 12 else 0xFFFF
+
+    # Section virtual addresses (needed to convert seg:off -> RVA)
+    sections = []
+    if sec_hdr_idx != 0xFFFF:
+        sec_data = read_stream(sec_hdr_idx)
+        sections = [struct.unpack_from('<I', sec_data, i * 40 + 12)[0] for i in range(len(sec_data) // 40)]
+
+    # Parse symbol records stream for S_PUB32 (public function) records
+    sym_data = read_stream(sym_rec_idx)
+    S_PUB32 = 0x110E
+    result = {}
+    o = 0
+    while o + 4 <= len(sym_data):
+        rec_len, rec_typ = struct.unpack_from('<HH', sym_data, o)
+        rec_end = o + 2 + rec_len
+        if rec_len < 2 or rec_end > len(sym_data):
+            break
+        if rec_typ == S_PUB32 and rec_end >= o + 14:
+            pub_flags, off, seg = struct.unpack_from('<IIH', sym_data, o + 4)
+            if pub_flags & 0x2 and 1 <= seg <= len(sections):
+                nul = sym_data.find(b'\x00', o + 14, rec_end)
+                if nul != -1:
+                    name = sym_data[o + 14:nul].decode('ascii', errors='replace')
+                    if name.startswith('?'):
+                        name = _undecorate(name)
+                    if re.match(r'^FUN_[0-9A-Fa-f]+$', name):
+                        o = rec_end
+                        continue
+                    # Strip embedded full-address suffix (e.g. WriteToSaveGame_1404D62A0)
+                    name = re.sub(r'_14[0-9A-Fa-f]{6,8}$', '', name)
+                    # Replace __ namespace separator with ::
+                    name = re.sub(r':{3,}', '::', name.replace('__', '::'))
+                    result[sections[seg - 1] + off] = name
+        o = rec_end
+
+    return result
+
+
+def load_ae_rename_db(file_path, ae_db):
+    """Load skyrimae.rename: lines of '<ae_id> <name>', skip version line."""
+    result = {}  # ae_offset -> name
+    if not os.path.exists(file_path):
+        return result
+    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = f.readlines()
+    for line in lines[1:]:  # skip version line
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(' ', 1)
+        if len(parts) != 2:
+            continue
+        name = parts[1].rstrip('*').rstrip('_')
+        try:
+            ae_id = int(parts[0])
+        except ValueError:
+            continue
+        off = ae_db.get(ae_id)
+        if off:
+            result[off] = name
+    return result
+
+
+def _load_extra_types():
+    """Load extra_types.json. Returns dict with keys typedefs/enums/opaques."""
+    import json as _json
+    if not os.path.isfile(EXTRA_TYPES_JSON):
+        return {'typedefs': {}, 'enums': {}, 'opaques': {}}
+    with open(EXTRA_TYPES_JSON, 'r', encoding='utf-8') as _f:
+        data = _json.load(_f)
+    return {
+        'typedefs': data.get('typedefs', {}),
+        'enums':    data.get('enums', {}),
+        'opaques':  data.get('opaques', {}),
+    }
+
+
+_BASE_TO_C = {
+    'u32': 'unsigned int', 'i32': 'int',
+    'u64': 'unsigned long long', 'i64': 'long long',
+    'u16': 'unsigned short', 'i16': 'short',
+    'u8':  'unsigned char',  'i8':  'char',
+}
+
+
+def build_c_prelude(extra):
+    """Build a C declaration prelude from extra_types data for CParserUtils."""
+    lines = []
+    for name, info in sorted(extra['typedefs'].items()):
+        c_base = _BASE_TO_C.get(info['base'], 'unsigned int')
+        lines.append('typedef {} {};'.format(c_base, name))
+    for name, info in sorted(extra['enums'].items()):
+        values = info.get('values', {})
+        if values:
+            body = ', '.join('{}={}'.format(k, v) for k, v in values.items())
+            lines.append('enum {} {{ {} }};'.format(name, body))
+        else:
+            lines.append('typedef unsigned int {};'.format(name))
+    for name in sorted(extra['opaques']):
+        lines.append('struct {};'.format(name))
+        lines.append('typedef struct {} {};'.format(name, name))
+    return '\n'.join(lines)
 
 VERSIONS = {
     'se': {
@@ -472,6 +699,14 @@ def _map_type(typ, depth=0):
 
     # Struct/class record
     if kind == ci.TypeKind.RECORD:
+        # Prefer typ.spelling for template instantiations — it preserves angle
+        # brackets (e.g. 'RE::NiPointer<RE::BSTriShape>') so downstream code
+        # can distinguish instantiations.  Fall back to cursor-derived name for
+        # non-template types where spelling may be less stable.
+        type_spell = typ.spelling or ''
+        if '<' in type_spell:
+            # Template instantiation: use full spelling as the descriptor name
+            return 'struct:' + type_spell
         decl = typ.get_declaration()
         if decl and decl.spelling:
             name = _get_full_qual_name(decl)
@@ -788,12 +1023,22 @@ def get_builtin(type_str):
     if type_str == 'ptr':  return _PTR
     return None
 
+def _resolve_struct_name(name):
+    """Look up a struct/class name in 'created', handling template instantiations."""
+    if '<' in name:
+        # Template instantiation: look up the sanitized alias in TEMPLATE_TYPE_MAP
+        alias = TEMPLATE_TYPE_MAP.get(name)
+        if alias:
+            return created.get(alias)
+        return None
+    return created.get(name) or created.get(name.split('::')[-1])
+
 def resolve_type(type_str):
     b = get_builtin(type_str)
     if b: return b
     if type_str.startswith('ptr:struct:'):
         name = type_str[11:]
-        inner = created.get(name) or created.get(name.split('::')[-1])
+        inner = _resolve_struct_name(name)
         return dtm.getPointer(inner, 8) if inner else _PTR
     if type_str.startswith('ptr:enum:'):
         name = type_str[9:]
@@ -821,7 +1066,7 @@ def resolve_type(type_str):
         return created.get(name) or created.get(name.split('::')[-1])
     if type_str.startswith('struct:'):
         name = type_str[7:]
-        return created.get(name) or created.get(name.split('::')[-1])
+        return _resolve_struct_name(name)
     if type_str.startswith('vtblptr:'):
         name = type_str[8:]
         vtbl_dt = created.get('vtbl:' + name)
@@ -1165,6 +1410,7 @@ def _import_symbols():
     for i, s in enumerate(SYMBOLS):
         off = s.get(version_key)
         if not off: continue
+        off = int(off)
 
         addr = base_addr.add(off)
         sname = s['n']
@@ -1283,11 +1529,19 @@ def _type_to_c(type_str):
     if type_str == 'f64':   return 'double'
     if type_str == 'ptr':   return 'void *'
     if type_str.startswith('ptr:struct:'):
-        return type_str[11:].split('::')[-1] + ' *'
+        name = type_str[11:]
+        if '<' in name:
+            alias = TEMPLATE_TYPE_MAP.get(name)
+            return (alias if alias else 'void') + ' *'
+        return name.split('::')[-1] + ' *'
     if type_str.startswith('ptr:enum:'):
         return type_str[9:].split('::')[-1] + ' *'
     if type_str.startswith('struct:'):
-        return type_str[7:].split('::')[-1]
+        name = type_str[7:]
+        if '<' in name:
+            alias = TEMPLATE_TYPE_MAP.get(name)
+            return alias if alias else 'void *'
+        return name.split('::')[-1]
     if type_str.startswith('enum:'):
         return type_str[5:].split('::')[-1]
     return 'void *'
@@ -1344,7 +1598,9 @@ def _import_vtable_names():
                                     param_parts.append(_type_to_c(ptype) + ' ' + pname)
                                 proto = (_type_to_c(slot_ret) + ' ' + slot_name +
                                          '(' + ', '.join(param_parts) + ')')
-                                func_def = CParserUtils.parseSignature(None, currentProgram, proto, True)
+                                proto = _patch_templates(proto)
+                                func_def = CParserUtils.parseSignature(None, currentProgram,
+                                    C_TYPE_PRELUDE + '\\n' + proto if C_TYPE_PRELUDE else proto, True)
                                 if func_def:
                                     ApplyFunctionSignatureCmd(func_addr, func_def,
                                         SourceType.USER_DEFINED, True, False).applyTo(currentProgram)
@@ -1360,7 +1616,7 @@ run()
 '''
 
 
-def generate_script(enums, structs, vtable_structs, output_path, version, symbols_json):
+def generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, c_prelude='', template_source=''):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     lines = [GHIDRA_MERGED_HEADER]
@@ -1420,6 +1676,22 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
 
     # Emit SYMBOLS (version-agnostic — version_key selected at runtime by VERSION)
     lines.append('SYMBOLS = ' + symbols_json)
+    lines.append('')
+
+    # Embed C prelude for CParserUtils signature parsing
+    lines.append('C_TYPE_PRELUDE = ' + repr(c_prelude))
+    lines.append('')
+
+    # Embed template type map and patch function (populated by template_types.py)
+    if template_source:
+        lines.append(template_source)
+    else:
+        lines.append('TEMPLATE_TYPE_MAP = {}')
+        lines.append('')
+        lines.append('def _patch_templates(proto):')
+        lines.append('    for _tmpl, _alias in sorted(TEMPLATE_TYPE_MAP.items(), key=lambda x: -len(x[0])):')
+        lines.append('        proto = proto.replace(_tmpl, _alias)')
+        lines.append('    return proto')
     lines.append('')
 
     lines.append(GHIDRA_MERGED_FOOTER)
@@ -2383,19 +2655,49 @@ def run_version(version, symbols_json):
     _inject_vtable_fields(structs, vtable_structs)
     _flatten_structs(structs)
 
+    # Inject manually-defined extra types from extra_types.json
+    extra = _load_extra_types()
+    category = '/CommonLibSSE/RE'
+    for name, info in extra['typedefs'].items():
+        if name not in enums and name not in structs:
+            # Register as a 0-field struct sized to match the base type
+            sz = {'u32': 4, 'i32': 4, 'u64': 8, 'i64': 8, 'u16': 2, 'i16': 2, 'u8': 1, 'i8': 1}.get(info['base'], 4)
+            structs[name] = {'name': name, 'full_name': name, 'size': sz,
+                             'category': category, 'fields': [], 'bases': [],
+                             'has_vtable': False}
+    for name, info in extra['enums'].items():
+        if name not in enums:
+            vals = [(k, v) for k, v in info.get('values', {}).items()]
+            enums[name] = {'name': name, 'full_name': name, 'size': info.get('size', 4),
+                           'category': category, 'values': vals}
+    for name in extra['opaques']:
+        if name not in structs and name not in enums:
+            structs[name] = {'name': name, 'full_name': name, 'size': 0,
+                             'category': category, 'fields': [], 'bases': [],
+                             'has_vtable': False}
+
+    c_prelude = build_c_prelude(extra)
+
+    # Optional: scan for C++ template instantiation types and extend the prelude
+    try:
+        from template_types import process_template_types as _process_templates
+        _tmpl = _process_templates(structs, extra_types=extra)
+        if _tmpl.c_prelude_fragment:
+            c_prelude = c_prelude + '\n' + _tmpl.c_prelude_fragment
+        template_source = _tmpl.combined_source()
+    except ImportError:
+        template_source = ''
+
     print('Generating Ghidra script...')
-    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json)
+    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, c_prelude, template_source)
     print('Output: {} ({} enums, {} structs)'.format(output_path, n_enums, n_structs))
 
 
 def main():
     import json as _json
-    import sys as _sys
-    _sys.path.insert(0, SCRIPT_DIR)
-    import extract_signatures
 
     # Load address databases (binary data, not source scanning)
-    addr_lib = extract_signatures.AddressLibrary()
+    addr_lib = AddressLibrary()
     addr_lib.load_all(os.path.join(SCRIPT_DIR, 'addresslibrary'))
     print('SE entries: {}, AE entries: {}'.format(len(addr_lib.se_db), len(addr_lib.ae_db)))
 
@@ -2494,7 +2796,7 @@ def main():
 
     # AE rename database fallback
     rename_db = os.path.join(SCRIPT_DIR, 'extern', 'AddressLibraryDatabase', 'skyrimae.rename')
-    ae_rename = extract_signatures.load_ae_rename_db(rename_db, addr_lib.ae_db)
+    ae_rename = load_ae_rename_db(rename_db, addr_lib.ae_db)
     rename_added = 0
     names_with_ae = set(s['n'] for s in symbols if s.get('a'))
     for ae_off, name in ae_rename.items():
@@ -2506,10 +2808,23 @@ def main():
         names_with_ae.add(name)
         symbols.append({'n': name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'})
         rename_added += 1
-    print('\nAdded {} symbols from AE rename database'.format(rename_added))
+    print('Added {} symbols from AE rename database'.format(rename_added))
 
+    # SE PDB public symbols fallback (mirrors AE rename, but for SE)
+    se_pdb_path = os.path.join(SCRIPT_DIR, 'pdbs', 'SkyrimSE.pdb')
+    se_pdb_names = load_se_pdb_names(se_pdb_path)
     pdb_added = 0
-    print('Added {} symbols from SE PDB (disabled)'.format(pdb_added))
+    names_with_se = set(s['n'] for s in symbols if s.get('s'))
+    for se_off, name in se_pdb_names.items():
+        if se_off in sym_seen_se:
+            continue
+        sym_seen_se.add(se_off)
+        if name in names_with_se:
+            continue
+        names_with_se.add(name)
+        symbols.append({'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'})
+        pdb_added += 1
+    print('Added {} symbols from SE PDB'.format(pdb_added))
 
     # Normalize __ → :: in all names
     for s in symbols:
