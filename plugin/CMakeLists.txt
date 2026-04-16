@@ -19,7 +19,7 @@ macro(find_commonlib_path)
 		# Check extern
 		find_path(CommonLibPath
 		include/REL/Relocation.h
-		PATHS extern/${CommonLibName})
+		PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../extern/${CommonLibName})
 		if (${CommonLibPath} STREQUAL "CommonLibPath-NOTFOUND")
 			#Check path
 			set_from_environment(${CommonLibName}Path)
@@ -93,7 +93,7 @@ if (DEFINED CommonLibPath AND NOT ${CommonLibPath} STREQUAL "" AND IS_DIRECTORY 
 else ()
 	message(
 		FATAL_ERROR
-		"Variable ${CommonLibName}Path is not set or in extern/."
+		"Variable ${CommonLibName}Path is not set or in ../extern/."
 	)
 endif()
 
@@ -187,6 +187,6 @@ endif()
 add_custom_command(
 	TARGET ${PROJECT_NAME}
 	POST_BUILD
-	COMMAND ${CMAKE_COMMAND} -E "$<IF:$<CONFIG:Debug>,make_directory,true>" "${CMAKE_SOURCE_DIR}/pdbs"
-	COMMAND ${CMAKE_COMMAND} -E "$<IF:$<CONFIG:Debug>,copy_if_different,true>" "$<TARGET_PDB_FILE:${PROJECT_NAME}>" "${CMAKE_SOURCE_DIR}/pdbs/${PDB_NAME}"
+	COMMAND ${CMAKE_COMMAND} -E "$<IF:$<CONFIG:Debug>,make_directory,true>" "${CMAKE_SOURCE_DIR}/../pdbs"
+	COMMAND ${CMAKE_COMMAND} -E "$<IF:$<CONFIG:Debug>,copy_if_different,true>" "$<TARGET_PDB_FILE:${PROJECT_NAME}>" "${CMAKE_SOURCE_DIR}/../pdbs/${PDB_NAME}"
 )

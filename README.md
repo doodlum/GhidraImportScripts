@@ -26,15 +26,21 @@ vtable layouts, and function signatures into Ghidra.
 
 ```
 MainMenuVideo/
-├── src/                        SKSE plugin C++ source
+├── plugin/                     SKSE plugin build project
+│   ├── src/                    C++ source files
+│   ├── cmake/                  CMake helpers (version templates, triplets)
+│   ├── CMakeLists.txt
+│   ├── CMakePresets.json
+│   └── vcpkg.json
 ├── extern/
-│   └── CommonLibSSE/           CommonLibSSE submodule (powerof3/dev branch)
+│   ├── CommonLibSSE/           CommonLibSSE submodule (powerof3/dev branch)
+│   └── AddressLibraryDatabase/ AE rename database submodule
 ├── addresslibrary/
 │   ├── version-1-5-97-0.bin    SE address library (ID → offset)
 │   └── versionlib-1-6-1170-0.bin  AE address library
 ├── pdbs/
-│   ├── GhidraImport_SE_D.pdb   SE debug PDB (type sizes + vtable layout)
-│   ├── GhidraImport_AE_D.pdb   AE debug PDB
+│   ├── GhidraImport_SE_D.pdb   SE debug PDB — written here by the plugin build
+│   ├── GhidraImport_AE_D.pdb   AE debug PDB — written here by the plugin build
 │   └── SkyrimSE.pdb            Optional: vanilla SE PDB for extra symbol names
 ├── ghidrascripts/
 │   ├── CommonLibImport_SE.py   Generated: import SE types + vtables + symbols
@@ -69,23 +75,27 @@ generator, then close it.
 ```bash
 git clone https://github.com/doodlum/MainMenuVideo.git
 cd MainMenuVideo
-git submodule init
-git submodule update
+git submodule update --init --recursive
 ```
 
 ### Build SE
 
 ```bash
-cmake --preset vs2022-windows-vcpkg-se
-cmake --build buildse --config Release
+cd plugin
+cmake --preset vs2026-windows-vcpkg-se
+cmake --build build --config Release
 ```
 
 ### Build AE
 
 ```bash
-cmake --preset vs2022-windows-vcpkg-ae
+cd plugin
+cmake --preset vs2026-windows-vcpkg-ae
 cmake --build buildae --config Release
 ```
+
+The debug builds copy the PDB to `pdbs/GhidraImport_SE_D.pdb` (or AE) at the
+repo root, where `parse_commonlib_types.py` expects to find them.
 
 ---
 
@@ -182,16 +192,15 @@ fallback if COM is unavailable.
 
 ## Setup
 
-All paths are relative to the repository root (`MainMenuVideo/`). The generator
-finds all inputs automatically — no environment variables are required beyond what
-is already set for the plugin build.
+All paths are relative to the repository root. The generator finds all inputs
+automatically — no environment variables are required.
 
 ```
 MainMenuVideo/
 ├── extern/CommonLibSSE/   ← must be populated (git submodule)
 ├── addresslibrary/        ← version-1-5-97-0.bin + versionlib-1-6-1170-0.bin
 └── pdbs/                  ← GhidraImport_SE_D.pdb + GhidraImport_AE_D.pdb
-                             (+ optionally SkyrimSE.pdb)
+                             (built by plugin debug build; + optionally SkyrimSE.pdb)
 ```
 
 ---
