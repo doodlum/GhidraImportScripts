@@ -2757,6 +2757,14 @@ def main():
         if fs['se_off'] and fs['se_off'] not in seen_se:
             seen_se.add(fs['se_off'])
             merged_funcs.append(fs)
+    # Correct static detection for src/ symbols using the header-derived static_methods set.
+    # cursor.is_static_method() on a .cpp definition can return False under libclang error
+    # recovery when the definition cannot be linked back to its (static) header declaration.
+    for fs in src_func_syms:
+        if not fs.get('is_static') and fs.get('class_') and fs.get('name'):
+            if (fs['class_'], fs['name']) in static_methods:
+                fs['is_static'] = True
+
     # Add src/ symbols not already found via headers
     for fs in src_func_syms:
         se_off = fs.get('se_off')
