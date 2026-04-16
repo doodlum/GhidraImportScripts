@@ -1294,12 +1294,13 @@ def run():
     finally:
         dtm.endTransaction(tx_types, True)
 
-    # Pass 2+3: apply symbol names then walk vtable addresses to name virtual funcs.
-    # Must run after types so VTABLE_ labels exist for the vtable walk.
+    # Pass 2+3+4: apply symbol names, walk vtable addresses, then apply fallback symbols.
+    # Fallback runs last so vtable-named functions are never overwritten by lower-priority sources.
     tx_syms = currentProgram.startTransaction('CommonLib symbol import')
     try:
         _import_symbols()
         _import_vtable_names()
+        _import_fallback_symbols()
     finally:
         currentProgram.endTransaction(tx_syms, True)
 
@@ -1612,11 +1613,66 @@ def _import_vtable_names():
     print('Named {} virtual functions from vtable addresses'.format(named_vfuncs))
 
 
+def _import_fallback_symbols():
+    """Apply AE rename / SE PDB fallback symbols only to addresses not yet named.
+
+    Runs after _import_vtable_names() so any function already named by the
+    vtable walk or the main symbol pass is left untouched.
+    """
+    version_key = 's' if VERSION == 'se' else 'a'
+    base_addr = currentProgram.getImageBase()
+    fm = currentProgram.getFunctionManager()
+    symbol_table = currentProgram.getSymbolTable()
+
+    print('Applying ' + str(len(FALLBACK_SYMBOLS)) + ' fallback symbols...')
+    count_applied = count_skipped = 0
+
+    for s in FALLBACK_SYMBOLS:
+        off = s.get(version_key)
+        if not off:
+            continue
+        addr = base_addr.add(int(off))
+        sname = s['n']
+
+        try:
+            f = fm.getFunctionAt(addr)
+            if not f:
+                DisassembleCommand(addr, None, True).applyTo(currentProgram)
+                f = fm.getFunctionAt(addr)
+
+            if f:
+                curr = f.getName()
+                if not (curr.startswith('FUN_') or curr.startswith('sub_')):
+                    count_skipped += 1
+                    continue
+                f.setName(sname, SourceType.USER_DEFINED)
+            else:
+                # No function at address — fall back to a plain label
+                symbol_table.createLabel(addr, sname, SourceType.USER_DEFINED)
+
+            src = s.get('src', '')
+            if src == 'skyrimae.rename':
+                comment = 'Source: AE rename database (fallback)'
+            elif src == 'SkyrimSE.pdb':
+                comment = 'Source: SkyrimSE.pdb public symbols (fallback)'
+            else:
+                comment = ''
+            if comment:
+                cu = currentProgram.getListing().getCodeUnitAt(addr)
+                if cu:
+                    cu.setComment(0, comment)
+            count_applied += 1
+        except:
+            pass
+
+    print('Fallback: applied ' + str(count_applied) + ', skipped (already named): ' + str(count_skipped))
+
+
 run()
 '''
 
 
-def generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, c_prelude='', template_source=''):
+def generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json='[]', c_prelude='', template_source=''):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     lines = [GHIDRA_MERGED_HEADER]
@@ -1676,6 +1732,10 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
 
     # Emit SYMBOLS (version-agnostic — version_key selected at runtime by VERSION)
     lines.append('SYMBOLS = ' + symbols_json)
+    lines.append('')
+
+    # Fallback symbols (AE rename / SE PDB new entries) applied after vtable walk
+    lines.append('FALLBACK_SYMBOLS = ' + fallback_symbols_json)
     lines.append('')
 
     # Embed C prelude for CParserUtils signature parsing
@@ -2614,7 +2674,7 @@ def _collect_src_relocations(src_dir, addr_lib, se_offset_map=None, ae_offset_ma
     return merged
 
 
-def run_version(version, symbols_json):
+def run_version(version, symbols_json, fallback_symbols_json='[]'):
     cfg = VERSIONS[version]
     pdb_path = cfg['pdb']
     output_path = cfg['output']
@@ -2689,7 +2749,7 @@ def run_version(version, symbols_json):
         template_source = ''
 
     print('Generating Ghidra script...')
-    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, c_prelude, template_source)
+    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json, c_prelude, template_source)
     print('Output: {} ({} enums, {} structs)'.format(output_path, n_enums, n_structs))
 
 
@@ -2802,37 +2862,60 @@ def main():
         if lbl['ae_off']: sym['a'] = lbl['ae_off']; sym_seen_ae.add(lbl['ae_off'])
         symbols.append(sym)
 
+    # Index symbols by name for merge lookups.  Both fallback passes below use
+    # this to merge a missing version offset into an existing entry (e.g. merge
+    # a SE offset from the PDB into a symbol already present as AE-only from the
+    # rename DB) rather than creating a duplicate entry with the same name.
+    name_to_sym = {s['n']: s for s in symbols}
+
     # AE rename database fallback
     rename_db = os.path.join(SCRIPT_DIR, 'extern', 'AddressLibraryDatabase', 'skyrimae.rename')
     ae_rename = load_ae_rename_db(rename_db, addr_lib.ae_db)
-    rename_added = 0
-    names_with_ae = set(s['n'] for s in symbols if s.get('a'))
+    rename_added = rename_merged = 0
     for ae_off, name in ae_rename.items():
         if ae_off in sym_seen_ae:
+            continue  # address already claimed by a higher-priority source
+        if name in name_to_sym:
+            # Symbol known from another source but missing its AE offset — merge it in.
+            existing = name_to_sym[name]
+            if not existing.get('a'):
+                existing['a'] = ae_off
+                sym_seen_ae.add(ae_off)
+                rename_merged += 1
             continue
         sym_seen_ae.add(ae_off)
-        if name in names_with_ae:
-            continue
-        names_with_ae.add(name)
-        symbols.append({'n': name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'})
+        sym = {'n': name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'}
+        symbols.append(sym)
+        name_to_sym[name] = sym
         rename_added += 1
-    print('Added {} symbols from AE rename database'.format(rename_added))
+    print('Added {} new symbols from AE rename, merged AE offset into {} existing'.format(
+        rename_added, rename_merged))
 
-    # SE PDB public symbols fallback (mirrors AE rename, but for SE)
+    # SE PDB public symbols fallback: true last resort — only adds symbols whose
+    # name and address are not already represented by any higher-priority source.
+    # When the name is already known (e.g. from the AE rename DB) but lacks an SE
+    # address, the SE offset is merged in rather than creating a duplicate entry.
     se_pdb_path = os.path.join(SCRIPT_DIR, 'pdbs', 'SkyrimSE.pdb')
     se_pdb_names = load_se_pdb_names(se_pdb_path)
-    pdb_added = 0
-    names_with_se = set(s['n'] for s in symbols if s.get('s'))
+    pdb_added = pdb_merged = 0
     for se_off, name in se_pdb_names.items():
         if se_off in sym_seen_se:
+            continue  # address already claimed by a higher-priority source
+        if name in name_to_sym:
+            # Symbol known from another source but missing its SE offset — merge it in.
+            existing = name_to_sym[name]
+            if not existing.get('s'):
+                existing['s'] = se_off
+                sym_seen_se.add(se_off)
+                pdb_merged += 1
             continue
         sym_seen_se.add(se_off)
-        if name in names_with_se:
-            continue
-        names_with_se.add(name)
-        symbols.append({'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'})
+        sym = {'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'}
+        symbols.append(sym)
+        name_to_sym[name] = sym
         pdb_added += 1
-    print('Added {} symbols from SE PDB'.format(pdb_added))
+    print('Added {} new symbols from SE PDB, merged SE offset into {} existing'.format(
+        pdb_added, pdb_merged))
 
     # Normalize __ → :: in all names
     for s in symbols:
@@ -2846,10 +2929,17 @@ def main():
     print('  Functions: {} ({} with signatures)'.format(len(funcs), with_sig))
     print('  Labels: {}'.format(labels_count))
 
-    symbols_json = _json.dumps(symbols, separators=(',', ':'))
+    _FALLBACK_SRCS = {'skyrimae.rename', 'SkyrimSE.pdb'}
+    primary_symbols  = [s for s in symbols if s.get('src') not in _FALLBACK_SRCS]
+    fallback_symbols = [s for s in symbols if s.get('src') in _FALLBACK_SRCS]
+    print('  Primary: {}, Fallback (AE rename / SE PDB new): {}'.format(
+        len(primary_symbols), len(fallback_symbols)))
+
+    symbols_json          = _json.dumps(primary_symbols,  separators=(',', ':'))
+    fallback_symbols_json = _json.dumps(fallback_symbols, separators=(',', ':'))
 
     for version in ('se', 'ae'):
-        run_version(version, symbols_json)
+        run_version(version, symbols_json, fallback_symbols_json)
 
 
 if __name__ == '__main__':
