@@ -1,7 +1,6 @@
-# MainMenuVideo — Ghidra Import Pipeline
+#  Ghidra Import Scripts
 
-SKSE plugin that displays videos in the main menu, plus a toolchain that
-reverse-engineers Skyrim SE/AE by importing CommonLibSSE type definitions,
+Toolchain that reverse-engineers Skyrim SE/AE by importing CommonLibSSE type definitions,
 vtable layouts, and function signatures into Ghidra.
 
 ---
@@ -25,7 +24,7 @@ vtable layouts, and function signatures into Ghidra.
 ## Project Layout
 
 ```
-MainMenuVideo/
+GhidraImportScripts/
 ├── plugin/                     SKSE plugin build project
 │   ├── src/                    C++ source files
 │   ├── cmake/                  CMake helpers (version templates, triplets)
@@ -73,8 +72,8 @@ generator, then close it.
 ### Clone and initialise
 
 ```bash
-git clone https://github.com/doodlum/MainMenuVideo.git
-cd MainMenuVideo
+git clone https://github.com/doodlum/GhidraImportScripts.git
+cd GhidraImportScripts
 git submodule update --init --recursive
 ```
 
@@ -196,7 +195,7 @@ All paths are relative to the repository root. The generator finds all inputs
 automatically — no environment variables are required.
 
 ```
-MainMenuVideo/
+GhidraImportScripts/
 ├── extern/CommonLibSSE/   ← must be populated (git submodule)
 ├── addresslibrary/        ← version-1-5-97-0.bin + versionlib-1-6-1170-0.bin
 └── pdbs/                  ← GhidraImport_SE_D.pdb + GhidraImport_AE_D.pdb
