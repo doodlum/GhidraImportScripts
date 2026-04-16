@@ -8,7 +8,9 @@
     "RefHandle":     { "base": "u32", "comment": "Generic BSPointerHandle — internally a uint32_t handle" },
     "VMHandle":      { "base": "u64", "comment": "RE::VMHandle = std::uint64_t" },
     "UPInt":         { "base": "u64", "comment": "GFx UPInt = size_t (8 bytes on x64)" },
-    "hkpShapeKey":   { "base": "u32", "comment": "Havok shape key = uint32_t" }
+    "hkpShapeKey":   { "base": "u32", "comment": "Havok shape key = uint32_t" },
+    "va_list":       { "base": "u64", "comment": "MSVC x64 va_list = char * (8 bytes)" },
+    "char16_t":      { "base": "u16", "comment": "C11 char16_t = uint16_t on MSVC x64" }
   },
 
   "enums": {
@@ -66,6 +68,61 @@
       "size": 4,
       "comment": "GFx LoadConstants flags — values unknown",
       "values": {}
+    },
+    "SpellType": {
+      "size": 4,
+      "comment": "MagicSystem::SpellType — values unknown",
+      "values": {}
+    },
+    "CastingSource": {
+      "size": 4,
+      "comment": "MagicSystem::CastingSource — values unknown",
+      "values": {}
+    },
+    "CannotCastReason": {
+      "size": 4,
+      "comment": "MagicSystem::CannotCastReason — values unknown",
+      "values": {}
+    },
+    "ActorValue": {
+      "size": 4,
+      "comment": "RE::ActorValue — actor value enum, values omitted for brevity",
+      "values": {}
+    },
+    "DEFAULT_OBJECT": {
+      "size": 4,
+      "comment": "BGSDefaultObjectManager::DEFAULT_OBJECT — values unknown",
+      "values": {}
+    },
+    "SOUND_LEVEL": {
+      "size": 4,
+      "comment": "SOUND_LEVEL enum — values unknown",
+      "values": {}
+    },
+    "ErrorCode": {
+      "size": 4,
+      "comment": "BSModelDB::ErrorCode — values unknown",
+      "values": {}
+    },
+    "ACTOR_LOS_LOCATION": {
+      "size": 4,
+      "comment": "Actor line-of-sight location enum — values unknown",
+      "values": {}
+    },
+    "ACTOR_VALUE_MODIFIER": {
+      "size": 4,
+      "comment": "Actor value modifier enum — values unknown",
+      "values": {}
+    },
+    "FormType": {
+      "size": 1,
+      "comment": "RE::FormType — 1-byte enum for TESForm type IDs",
+      "values": {}
+    },
+    "UI_MESSAGE_TYPE": {
+      "size": 4,
+      "comment": "UI_MESSAGE_TYPE enum — values unknown",
+      "values": {}
     }
   },
 
@@ -113,6 +170,107 @@
     "ArgsType":                      "BSModelDB args type",
     "hkpCharacterRigidBody":         "Havok character rigid body",
     "hkpCharacterRigidBodyListener": "Havok character rigid body listener",
-    "HWND":                          "Windows HWND (opaque handle pointer)"
+    "HWND":                          "Windows HWND (opaque handle pointer)",
+    "NiAVObject":                    "Gamebryo/NiRTTI scene graph node base",
+    "NiPoint3":                      "Gamebryo 3D float vector (x, y, z)",
+    "NiColorA":                      "Gamebryo RGBA color (r, g, b, a floats)",
+    "BSRenderPass":                  "BSRenderPass render submission record",
+    "BSShaderProperty":              "BSShaderProperty material/shader property",
+    "BSLight":                       "BSLight scene light",
+    "BSGeometry":                    "BSGeometry renderable geometry node",
+    "BSShader":                      "BSShader shader object",
+    "BSAnimNoteReceiver":            "BSAnimNoteReceiver animation note callback",
+    "BShkbAnimationGraph":           "BShkbAnimationGraph Havok behavior graph wrapper",
+    "IAnimationGraphManagerHolder":  "IAnimationGraphManagerHolder animation graph owner interface",
+    "BGSSoundDescriptorForm":        "BGSSoundDescriptorForm sound descriptor form",
+    "BGSDecalNode":                  "BGSDecalNode decal scene node",
+    "BSDynamicTriShape":             "BSDynamicTriShape dynamic triangle mesh",
+    "BGSImpactManager":              "BGSImpactManager impact effect manager singleton",
+    "BGSImpactDataSet":              "BGSImpactDataSet impact data set form",
+    "BGSNumericIDIndex":             "BGSNumericIDIndex numeric form ID index",
+    "BGSSaveLoadGame":               "BGSSaveLoadGame save/load manager",
+    "BGSPrimitive":                  "BGSPrimitive collision primitive form",
+    "TESHavokUtilities":             "TESHavokUtilities Havok scene utility singleton",
+    "TESRegionData":                 "TESRegionData region data base class",
+    "TESRegionDataGrass":            "TESRegionDataGrass region grass data",
+    "TESRegionDataObjects":          "TESRegionDataObjects region object data",
+    "TESRegionDataManager":          "TESRegionDataManager region data manager",
+    "TESIdleForm":                   "TESIdleForm idle animation form",
+    "ExtraDataList":                 "ExtraDataList extra data linked list on a form/ref",
+    "InventoryEntryData":            "InventoryEntryData inventory item entry",
+    "MagicItem":                     "MagicItem base class for spells/enchantments",
+    "MagicCaster":                   "MagicCaster magic casting interface",
+    "MagicSystem":                   "MagicSystem magic system namespace struct",
+    "MagicUtilities":                "MagicUtilities magic utility singleton",
+    "Effect":                        "Effect active magic effect descriptor",
+    "ActiveEffectFactory":           "ActiveEffectFactory active effect factory singleton",
+    "AIFormulas":                    "AIFormulas AI formula calculation utilities",
+    "HitData":                       "HitData combat hit data structure",
+    "MovementMessageActorCollision": "MovementMessageActorCollision movement collision message",
+    "ActorMotionFeedbackOutput":     "ActorMotionFeedbackOutput actor motion feedback",
+    "ControlMap":                    "ControlMap input control map singleton",
+    "BSGamepadDevice":               "BSGamepadDevice gamepad input device",
+    "SkyrimVM":                      "SkyrimVM Papyrus virtual machine singleton",
+    "ConsoleLog":                    "ConsoleLog Papyrus/debug console log",
+    "LooseFileStream":               "LooseFileStream loose file archive stream",
+    "AnimationFileManagerSingleton": "AnimationFileManagerSingleton hkb animation file manager",
+    "SendHUDMessage":                "SendHUDMessage HUD message sender",
+    "SendUIMessage":                 "SendUIMessage UI message sender singleton",
+    "PackageLocation":               "PackageLocation AI package target location",
+    "NiDefaultAVObjectPalette":      "NiDefaultAVObjectPalette named NiAVObject lookup table",
+    "BSScaleformExternalTexture":    "BSScaleformExternalTexture Scaleform external texture",
+    "hkpCollidable":                 "Havok collidable shape wrapper",
+    "hkVector4":                     "Havok SIMD 4-component float vector",
+    "hkVector4Comparison":           "Havok SIMD vector comparison mask",
+    "hkMoppBvTreeShapeBase":         "Havok MOPP bounding volume tree base",
+    "hkpBoxShape":                   "Havok box collision shape",
+    "hkpCapsuleShape":               "Havok capsule collision shape",
+    "hkpCompressedMeshShape":        "Havok compressed mesh collision shape",
+    "hkpConvexVerticesShape":        "Havok convex vertices collision shape",
+    "hkpListShape":                  "Havok list/container collision shape",
+    "hkpMoppBvTreeShape":            "Havok MOPP BV tree collision shape",
+    "hkpSphereShape":                "Havok sphere collision shape",
+    "hkpRigidBody":                  "Havok rigid body physics object",
+    "bhkRigidBody":                  "Bethesda Havok rigid body wrapper",
+    "bhkShape":                      "Bethesda Havok collision shape base",
+    "CFilter":                       "Havok/Bethesda collision filter mask",
+    "Result":                        "hkResult Havok operation result code",
+    "hkpCdBody":                     "Havok collision detection body",
+    "hkpRayHitCollector":            "Havok ray hit collector interface",
+    "hkpSphere":                     "Havok sphere geometry descriptor",
+    "hkSphere":                      "Havok sphere geometry descriptor (hkSphere variant)",
+    "hkp3AxisSweep":                 "Havok 3-axis sweep broadphase",
+    "hkpBroadPhaseHandle":           "Havok broadphase handle",
+    "hkpCachingShapePhantom":        "Havok caching shape phantom",
+    "hkpWorld":                      "Havok physics world",
+    "hkpEntity":                     "Havok physics entity",
+    "hkpPhantom":                    "Havok physics phantom",
+    "hkpSimulationIsland":           "Havok simulation island",
+    "hkpWorldObject":                "Havok physics world object base",
+    "ahkpCharacterProxy":            "Bethesda Havok character proxy",
+    "ahkpWorld":                     "Bethesda Havok world wrapper",
+    "bhkCharacterStateClimbing":     "Bethesda Havok character climbing state",
+    "hkbBehaviorGraph":              "Havok behavior graph",
+    "hkbStateMachine":               "Havok behavior state machine",
+    "hkQsTransform":                 "Havok quaternion-scale transform",
+    "hkaAnimation":                  "Havok animation base",
+    "hkaAnimationControl":           "Havok animation control base",
+    "hkaDefaultAnimationControl":    "Havok default animation control",
+    "NiCamera":                      "Gamebryo camera scene node",
+    "NiMatrix3":                     "Gamebryo 3x3 rotation matrix",
+    "BSCullingProcess":              "BSCullingProcess scene culling pass",
+    "BSParabolicCullingProcess":     "BSParabolicCullingProcess parabolic culling pass",
+    "NiBackToFrontAccumulator":      "Gamebryo back-to-front sort accumulator",
+    "BSString":                      "BSString managed string type",
+    "BSStream":                      "BSStream serialization stream",
+    "ObjectBindPolicy":              "ObjectBindPolicy VM object binding policy",
+    "ProjectileHandle":              "BSPointerHandle<Projectile> handle",
+    "LaunchData":                    "Projectile launch data",
+    "BSSoundHandle":                 "BSSoundHandle audio instance handle",
+    "TESFile":                       "TESFile plugin/ESP/ESM file object",
+    "TESDescription":                "TESDescription form description string",
+    "TaskQueueInterface":            "TaskQueueInterface background task queue",
+    "SpellItem":                     "SpellItem spell form",
+    "BSPathingRequest":              "BSPathingRequest AI pathing request"
   }
 }

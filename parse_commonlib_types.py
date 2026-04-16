@@ -901,7 +901,9 @@ def _collect_types(tu):
                                 ret = _map_type(child.result_type)
                                 params = []
                                 for i, p in enumerate(child.get_arguments()):
-                                    pname = p.spelling or 'p{}'.format(i)
+                                    raw_pname = re.sub(r'[\s\xa0]+', '', p.spelling)
+                                    raw_pname = re.sub(r'[^a-zA-Z0-9_]', '', raw_pname)
+                                    pname = raw_pname or 'p{}'.format(i)
                                     ptype = _map_type(p.type)
                                     params.append((pname, ptype))
                                 vmethods[mname] = (ret, params)
@@ -1182,6 +1184,8 @@ def convert_sig_to_ghidra(sig, func_name):
             t = re.sub(r'\\w[\\w:]*<[^<>]*>', 'void', t)
             if t == prev: break
         t = re.sub(r'Args\\s*\\.\\.\\..*', '', t)
+        if not is_return:
+            t = re.sub(r'\\[.*?\\]', '', t)
         t = re.sub(r'\\w+::', '', t)
         return t.strip()
 
@@ -2378,8 +2382,10 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
         try:
             parts = []
             for i, p in enumerate(func_cursor.get_arguments()):
-                ptype = p.type.spelling
-                pname = p.spelling or 'p{}'.format(i)
+                ptype = re.sub(r'[\s\xa0]+', ' ', p.type.spelling).strip()
+                raw_pname = re.sub(r'[\s\xa0]+', '', p.spelling)
+                raw_pname = re.sub(r'[^a-zA-Z0-9_]', '', raw_pname)
+                pname = raw_pname or 'p{}'.format(i)
                 parts.append('{} {}'.format(ptype, pname).strip())
             return ', '.join(parts)
         except Exception:
@@ -2414,7 +2420,7 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                     if fcls and fcls.startswith('RE::'):
                         fcls = fcls[4:]
             try:
-                fret = cursor.result_type.spelling
+                fret = re.sub(r'[\s\xa0]+', ' ', cursor.result_type.spelling).strip()
                 fps = params_to_str(cursor)
                 fstatic = cursor.is_static_method()
             except Exception:
