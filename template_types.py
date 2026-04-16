@@ -73,6 +73,14 @@ from typing import Dict, List, Optional, Set
 # Result dataclass
 # ---------------------------------------------------------------------------
 
+def _display_name(orig: str) -> str:
+    """Strip ``RE::`` namespace prefix for display-friendly template names.
+
+    Example: ``RE::NiPointer<RE::BSTriShape>`` -> ``NiPointer<BSTriShape>``
+    """
+    return orig.replace('RE::', '')
+
+
 @dataclass
 class TemplateResult:
     """
@@ -82,8 +90,12 @@ class TemplateResult:
     ----------
     template_map:
         Maps the original C++ template instantiation name (as it appears in
-        source/signatures) to a sanitized C identifier alias.
-        Example: ``{'NiPointer<BSTriShape>': 'NiPointer_BSTriShape'}``
+        source/signatures) to a display-friendly name (``RE::`` stripped).
+        Example: ``{'RE::NiPointer<RE::BSTriShape>': 'NiPointer<BSTriShape>'}``
+    c_alias_map:
+        Maps the original C++ template instantiation name to a sanitized
+        C identifier alias for use in ``CParserUtils.parseSignature()`` prototypes.
+        Example: ``{'RE::NiPointer<RE::BSTriShape>': 'RE_NiPointer_RE_BSTriShape'}``
     c_prelude_fragment:
         C declaration block (struct forward-decls + typedefs) that can be
         appended to ``C_TYPE_PRELUDE``.
@@ -95,6 +107,7 @@ class TemplateResult:
         function, ready to be embedded verbatim in a generated Ghidra script.
     """
     template_map: Dict[str, str] = dc_field(default_factory=dict)
+    c_alias_map: Dict[str, str] = dc_field(default_factory=dict)
     c_prelude_fragment: str = ''
     map_source: str = 'TEMPLATE_TYPE_MAP = {}\n'
     patch_fn_source: str = (
@@ -170,8 +183,9 @@ def sanitize_template_name(name: str) -> str:
 # Template name extraction
 # ---------------------------------------------------------------------------
 
-# Matches an identifier immediately followed by '<', e.g. "NiPointer<"
-_IDENT_LT = re.compile(r'([A-Za-z_]\w*)\s*<')
+# Matches an optionally namespace-qualified identifier immediately followed by
+# '<', e.g. "NiPointer<", "RE::NiPointer<", "RE::BSTArray<"
+_IDENT_LT = re.compile(r'((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*<')
 
 
 def extract_template_names(text: str) -> Set[str]:
@@ -236,18 +250,23 @@ def _templates_from_descriptor(desc: str) -> Set[str]:
 
     Descriptors produced by ``_map_type`` look like::
 
-        'ptr:struct:NiPointer<BSTriShape>'
+        'ptr:struct:RE::NiPointer<RE::BSTriShape>'
         'struct:BSTArray<NiPointer<X>>'
         'arr:8:struct:BSSimpleList<TESForm *>'
 
-    The template-bearing name is in the last colon-separated segment that
-    contains ``<``.
+    The type name (which may contain ``::`` namespace separators) is everything
+    after the last recognised prefix token (``ptr``, ``struct``, ``enum``,
+    ``arr``, or a numeric array size).  A naive ``.split(':')`` would break
+    ``::`` into empty segments, so we protect ``::`` with a sentinel first.
     """
     if '<' not in desc:
         return set()
-    for part in reversed(desc.split(':')):
-        if '<' in part:
-            return extract_template_names(part)
+    # Protect C++ '::' namespace separators from being split on ':'
+    protected = desc.replace('::', '\x00')
+    for part in reversed(protected.split(':')):
+        restored = part.replace('\x00', '::')
+        if '<' in restored:
+            return extract_template_names(restored)
     return set()
 
 
@@ -321,11 +340,16 @@ def build_template_result(template_names: Set[str]) -> TemplateResult:
     if not template_names:
         return TemplateResult()
 
+    # template_map: original → display name (RE:: stripped)
+    # c_alias_map: original → sanitized C identifier
     template_map: Dict[str, str] = {}
+    c_alias_map: Dict[str, str] = {}
     for name in sorted(template_names):
         sanitized = sanitize_template_name(name)
-        if sanitized:
-            template_map[name] = sanitized
+        display = _display_name(name)
+        if sanitized and display:
+            template_map[name] = display
+            c_alias_map[name] = sanitized
 
     if not template_map:
         return TemplateResult()
@@ -333,7 +357,7 @@ def build_template_result(template_names: Set[str]) -> TemplateResult:
     # C prelude fragment -------------------------------------------------------
     prelude_lines: List[str] = []
     seen: Set[str] = set()
-    for _orig, sanitized in sorted(template_map.items(), key=lambda kv: kv[1]):
+    for _orig, sanitized in sorted(c_alias_map.items(), key=lambda kv: kv[1]):
         if sanitized in seen:
             continue
         seen.add(sanitized)
@@ -341,24 +365,32 @@ def build_template_result(template_names: Set[str]) -> TemplateResult:
         prelude_lines.append(f'typedef struct {sanitized} {sanitized};')
     c_prelude_fragment = '\n'.join(prelude_lines) + '\n'
 
-    # Python source: TEMPLATE_TYPE_MAP -----------------------------------------
+    # Python source: TEMPLATE_TYPE_MAP (original → display name for field resolution)
     map_lines = ['TEMPLATE_TYPE_MAP = {']
-    for orig, sanitized in sorted(template_map.items()):
-        map_lines.append(f'    {orig!r}: {sanitized!r},')
+    for orig in sorted(template_map):
+        map_lines.append(f'    {orig!r}: {template_map[orig]!r},')
     map_lines.append('}')
     map_source = '\n'.join(map_lines) + '\n'
 
-    # Python source: _patch_templates helper -----------------------------------
+    # Python source: TEMPLATE_C_ALIAS_MAP (original → sanitized C name for CParserUtils)
+    alias_lines = ['TEMPLATE_C_ALIAS_MAP = {']
+    for orig in sorted(c_alias_map):
+        alias_lines.append(f'    {orig!r}: {c_alias_map[orig]!r},')
+    alias_lines.append('}')
+    map_source += '\n' + '\n'.join(alias_lines) + '\n'
+
+    # Python source: _patch_templates uses C alias map for valid C identifiers
     patch_fn_source = (
         'def _patch_templates(proto):\n'
         '    """Substitute C++ template type names with C-safe aliases before parseSignature."""\n'
-        '    for _tmpl, _alias in sorted(TEMPLATE_TYPE_MAP.items(), key=lambda x: -len(x[0])):\n'
+        '    for _tmpl, _alias in sorted(TEMPLATE_C_ALIAS_MAP.items(), key=lambda x: -len(x[0])):\n'
         '        proto = proto.replace(_tmpl, _alias)\n'
         '    return proto\n'
     )
 
     return TemplateResult(
         template_map=template_map,
+        c_alias_map=c_alias_map,
         c_prelude_fragment=c_prelude_fragment,
         map_source=map_source,
         patch_fn_source=patch_fn_source,
@@ -424,11 +456,5 @@ def process_template_types(
     """
     names  = collect_template_names(structs, sig_strings)
     result = build_template_result(names)
-
-    if extra_types is not None and result.template_map:
-        opaques = extra_types.setdefault('opaques', {})
-        for original, sanitized in result.template_map.items():
-            if sanitized not in opaques:
-                opaques[sanitized] = f'Template instantiation alias for {original}'
 
     return result

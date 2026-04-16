@@ -55,10 +55,12 @@ STATIC METHOD DETECTION
   the flag defaults to False.  The Skyrim.h header parse does correctly mark
   statics, so header-derived symbols are unaffected.
 
-MISSING DEPENDENCY: binary_io
-  'binary_io/file_stream.hpp' is not present in the extern/ tree.  libclang
-  emits one error per parse pass but recovers; all types that depend on that
-  header are either skipped or receive error-recovery ('int') types.
+THIRD-PARTY DEPENDENCIES: binary_io, spdlog (RESOLVED)
+  'binary_io/file_stream.hpp' and 'spdlog/spdlog.h' are not part of CommonLibSSE
+  but are required by its PCH.  The script adds them via -isystem from vcpkg
+  ($VCPKG_ROOT/installed/x64-windows/include) or falls back to generated stubs
+  in _clang_stubs/.  Without either, a fatal parse error breaks template
+  instantiation for ~1300 structs (TESForm and all descendants get size=1).
 
 STRUCT FIELD SIZES — PDB cross-reference
   PDB type info is loaded via DIA SDK (COM) or a manual TPI stream parser.
@@ -510,7 +512,7 @@ def _load_pdb_types_dia(pdb_path):
             name = sym.name
         except Exception:
             continue
-        if not name or not name.startswith('RE::') or '<' in name:
+        if not name or not name.startswith('RE::'):
             continue
         try:
             size = sym.length
@@ -578,6 +580,43 @@ def load_pdb_types(pdb_path):
         return {}
     return _load_pdb_types_dia(pdb_path)
 
+# Third-party include directory for headers required by CommonLibSSE PCH
+# (binary_io, spdlog).  Without these, PCH.h triggers a fatal error that
+# aborts parsing and prevents libclang from instantiating templates — causing
+# ~1300 structs (TESForm and all descendants) to report size=1.
+#
+# Prefer real vcpkg-installed headers ($VCPKG_ROOT/installed/x64-windows/include);
+# fall back to minimal stubs generated in _clang_stubs/ if vcpkg is unavailable.
+_VCPKG_INCLUDE = None
+_vcpkg_root = os.environ.get('VCPKG_ROOT', '')
+if _vcpkg_root:
+    for _triplet in ('x64-windows-static', 'x64-windows'):
+        _candidate = os.path.join(_vcpkg_root, 'installed', _triplet, 'include')
+        if (os.path.isfile(os.path.join(_candidate, 'binary_io', 'file_stream.hpp'))
+                and os.path.isfile(os.path.join(_candidate, 'spdlog', 'spdlog.h'))):
+            _VCPKG_INCLUDE = _candidate
+            break
+
+if _VCPKG_INCLUDE:
+    _THIRD_PARTY_INCLUDE = _VCPKG_INCLUDE
+else:
+    # Generate minimal stubs so parsing doesn't fatal-error
+    _STUB_DIR = os.path.join(SCRIPT_DIR, '_clang_stubs')
+    os.makedirs(os.path.join(_STUB_DIR, 'binary_io'), exist_ok=True)
+    os.makedirs(os.path.join(_STUB_DIR, 'spdlog'), exist_ok=True)
+
+    _binary_io_stub = os.path.join(_STUB_DIR, 'binary_io', 'file_stream.hpp')
+    if not os.path.isfile(_binary_io_stub):
+        with open(_binary_io_stub, 'w') as _f:
+            _f.write('#pragma once\nnamespace binary_io { class file_istream {}; class file_ostream {}; }\n')
+
+    _spdlog_stub = os.path.join(_STUB_DIR, 'spdlog', 'spdlog.h')
+    if not os.path.isfile(_spdlog_stub):
+        with open(_spdlog_stub, 'w') as _f:
+            _f.write('#pragma once\nnamespace spdlog { class logger {}; }\n')
+
+    _THIRD_PARTY_INCLUDE = _STUB_DIR
+
 PARSE_ARGS_BASE = [
     '-x', 'c++',
     '-std=c++23',
@@ -585,6 +624,7 @@ PARSE_ARGS_BASE = [
     '-fms-extensions',
     '-DWIN32', '-D_WIN64',
     '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH',  # suppress STL1000 clang version check
+    '-isystem', _THIRD_PARTY_INCLUDE,  # binary_io/spdlog (vcpkg or stubs)
     '-I' + COMMONLIB_INCLUDE,
 ]
 
@@ -684,6 +724,19 @@ def _map_type(typ, depth=0):
     # Elaborated type (e.g. "struct Foo", "enum Bar") → unwrap
     if kind == ci.TypeKind.ELABORATED:
         return _map_type(typ.get_named_type(), depth + 1)
+
+    # UNEXPOSED — template instantiations that libclang cannot fully resolve.
+    # Check if the canonical type is a RECORD with template angle brackets;
+    # if so, use the canonical spelling as the struct descriptor name.
+    if kind == ci.TypeKind.UNEXPOSED:
+        canonical = typ.get_canonical()
+        canon_spell = canonical.spelling or ''
+        if '<' in canon_spell:
+            return 'struct:' + canon_spell
+        # Otherwise fall through to canonical resolution
+        if canonical.kind != ci.TypeKind.UNEXPOSED:
+            return _map_type(canonical, depth + 1)
+        return 'ptr'
 
     # Typedef → follow canonical
     if kind == ci.TypeKind.TYPEDEF:
@@ -851,6 +904,7 @@ def _collect_types(tu):
 
             # Collect fields
             fields = []
+            field_type_hints = {}  # name → type descriptor (for fields where offset is unknown)
             bases = []
             has_vtable = False
             vmethods = {}  # name -> (ret_type_str, [(param_name, param_type_str)])
@@ -870,6 +924,10 @@ def _collect_types(tu):
                     fname = child.spelling
                     if not fname:
                         continue
+                    # Always collect field type hint (even if offset unknown)
+                    ftype_hint = _map_type(child.type)
+                    if ftype_hint and ftype_hint not in ('ptr', 'bytes:0'):
+                        field_type_hints[fname] = ftype_hint
                     # Get offset in bytes
                     try:
                         offset_bits = cursor.type.get_offset(fname)
@@ -916,6 +974,7 @@ def _collect_types(tu):
                 'size': sz,
                 'category': category,
                 'fields': fields,
+                'field_type_hints': field_type_hints,
                 'bases': bases,
                 'has_vtable': has_vtable,
                 'vmethods': vmethods,
@@ -1112,13 +1171,7 @@ def convert_sig_to_ghidra(sig, func_name):
     sig = re.sub(r'\\bvirtual\\b', '', sig)
     sig = sig.strip()
 
-    sig_pre = sig
-    for _ in range(5):
-        prev = sig_pre
-        sig_pre = re.sub(r'\\w[\\w:]*<[^<>]*>\\s*\\*', 'void *', sig_pre)
-        sig_pre = re.sub(r'\\w[\\w:]*<[^<>]*>', 'void', sig_pre)
-        if sig_pre == prev: break
-    sig = sig_pre
+    sig = _patch_templates(sig)
 
     candidates = []
     depth = 0
@@ -1370,6 +1423,16 @@ def _import_types():
         ns = category[len('/CommonLibSSE/'):].replace('/', '::')
         if ns:
             created[ns + '::' + name] = dt
+    # Also register C-safe alias names for template structs (for CParserUtils resolution)
+    _display_to_c = {}
+    for _orig, _display in TEMPLATE_TYPE_MAP.items():
+        _c_alias = TEMPLATE_C_ALIAS_MAP.get(_orig, '')
+        if _c_alias and _display != _c_alias:
+            _display_to_c[_display] = _c_alias
+    for _display, _c_alias in _display_to_c.items():
+        dt = created.get(_display)
+        if dt and _c_alias not in created:
+            created[_c_alias] = dt
     print('Created {} struct shells'.format(len(STRUCTS)))
 
     # Pass 1d: fill in struct fields
@@ -1536,7 +1599,7 @@ def _type_to_c(type_str):
     if type_str.startswith('ptr:struct:'):
         name = type_str[11:]
         if '<' in name:
-            alias = TEMPLATE_TYPE_MAP.get(name)
+            alias = TEMPLATE_C_ALIAS_MAP.get(name)
             return (alias if alias else 'void') + ' *'
         return name.split('::')[-1] + ' *'
     if type_str.startswith('ptr:enum:'):
@@ -1544,7 +1607,7 @@ def _type_to_c(type_str):
     if type_str.startswith('struct:'):
         name = type_str[7:]
         if '<' in name:
-            alias = TEMPLATE_TYPE_MAP.get(name)
+            alias = TEMPLATE_C_ALIAS_MAP.get(name)
             return alias if alias else 'void *'
         return name.split('::')[-1]
     if type_str.startswith('enum:'):
@@ -1561,14 +1624,25 @@ def _import_vtable_names():
     memory = currentProgram.getMemory()
     ptr_size = currentProgram.getDefaultPointerSize()
     named_vfuncs = 0
+    dbg_no_label = 0
+    dbg_read_fail = 0
+    dbg_no_func = 0
+    dbg_already_named = 0
+    dbg_label_found = 0
     for vt in VTABLES:
         vname, class_full_name, vtbl_size, category, slots = vt
         class_short = class_full_name.split('::')[-1]
         vtbl_label = 'VTABLE_' + class_short
         vtbl_syms = list(sym_table.getSymbols(vtbl_label))
         if not vtbl_syms:
+            dbg_no_label += 1
             continue
+        dbg_label_found += 1
         vtbl_addr = vtbl_syms[0].getAddress()
+        # Debug: log first few vtable walks
+        if dbg_label_found <= 3:
+            print('  [vtbl-dbg] {} at {} (ptr_size={}, slots={})'.format(
+                vtbl_label, vtbl_addr, ptr_size, len(slots)))
         for slot_off, slot_name, slot_ret, slot_params in slots:
             if slot_name.startswith('fn_'):
                 continue
@@ -1581,40 +1655,115 @@ def _import_vtable_names():
                 else:
                     raw = memory.getInt(ptr_addr) & 0xFFFFFFFF
                 func_addr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(raw)
+                # Debug: log first slot of first few vtables
+                if dbg_label_found <= 3 and slot_off == 0:
+                    print('  [vtbl-dbg]   slot 0: ptr_addr={} raw=0x{:X} func_addr={}'.format(
+                        ptr_addr, raw, func_addr))
                 func = fm.getFunctionAt(func_addr)
                 if not func:
                     DisassembleCommand(func_addr, None, True).applyTo(currentProgram)
                     func = fm.getFunctionAt(func_addr)
-                if func:
-                    curr = func.getName()
-                    if curr.startswith('FUN_') or curr.startswith('sub_'):
-                        func.setName(class_short + '::' + slot_name, SourceType.USER_DEFINED)
-                        cu = currentProgram.getListing().getCodeUnitAt(func_addr)
-                        if cu:
-                            cu.setComment(0, (
-                                'VTABLE ' + class_full_name + '::' + slot_name + '\\n' +
-                                'Slot offset: +0x{:X}\\n'.format(slot_off) +
-                                'Source: CommonLibSSE vtable walk'
-                            ))
-                        if slot_ret is not None and slot_params is not None:
-                            try:
-                                param_parts = [class_short + ' * this']
-                                for pname, ptype in slot_params:
-                                    param_parts.append(_type_to_c(ptype) + ' ' + pname)
-                                proto = (_type_to_c(slot_ret) + ' ' + slot_name +
-                                         '(' + ', '.join(param_parts) + ')')
-                                proto = _patch_templates(proto)
-                                func_def = CParserUtils.parseSignature(None, currentProgram,
-                                    C_TYPE_PRELUDE + '\\n' + proto if C_TYPE_PRELUDE else proto, True)
-                                if func_def:
-                                    ApplyFunctionSignatureCmd(func_addr, func_def,
-                                        SourceType.USER_DEFINED, True, False).applyTo(currentProgram)
-                            except Exception:
-                                pass
-                        named_vfuncs += 1
-            except Exception:
-                pass
+                if not func:
+                    dbg_no_func += 1
+                    if dbg_no_func <= 3:
+                        print('  [vtbl-dbg]   NO FUNC at {} for {}::{} (raw=0x{:X})'.format(
+                            func_addr, class_short, slot_name, raw))
+                    continue
+                curr = func.getName()
+                if not (curr.startswith('FUN_') or curr.startswith('sub_')):
+                    dbg_already_named += 1
+                    continue
+                func.setName(class_short + '::' + slot_name, SourceType.USER_DEFINED)
+                cu = currentProgram.getListing().getCodeUnitAt(func_addr)
+                if cu:
+                    cu.setComment(0, (
+                        'VTABLE ' + class_full_name + '::' + slot_name + '\\n' +
+                        'Slot offset: +0x{:X}\\n'.format(slot_off) +
+                        'Source: CommonLibSSE vtable walk'
+                    ))
+                if slot_ret is not None and slot_params is not None:
+                    try:
+                        param_parts = [class_short + ' * this']
+                        for pname, ptype in slot_params:
+                            param_parts.append(_type_to_c(ptype) + ' ' + pname)
+                        proto = (_type_to_c(slot_ret) + ' ' + slot_name +
+                                 '(' + ', '.join(param_parts) + ')')
+                        proto = _patch_templates(proto)
+                        func_def = CParserUtils.parseSignature(None, currentProgram,
+                            C_TYPE_PRELUDE + '\\n' + proto if C_TYPE_PRELUDE else proto, True)
+                        if func_def:
+                            ApplyFunctionSignatureCmd(func_addr, func_def,
+                                SourceType.USER_DEFINED, True, False).applyTo(currentProgram)
+                    except Exception:
+                        pass
+                named_vfuncs += 1
+            except Exception as ex:
+                dbg_read_fail += 1
+                if dbg_read_fail <= 5:
+                    print('  [vtbl-dbg]   EXCEPTION at {}::{} slot +0x{:X}: {}'.format(
+                        class_short, slot_name, slot_off, str(ex)))
     print('Named {} virtual functions from vtable addresses'.format(named_vfuncs))
+    print('  vtable debug: labels_found={} no_label={} read_fail={} no_func={} already_named={}'.format(
+        dbg_label_found, dbg_no_label, dbg_read_fail, dbg_no_func, dbg_already_named))
+
+    # --- Second pass: walk VTABLE_ labels that have no struct definition ---
+    # These are VTABLE_ symbols created by _import_symbols() but not in VTABLES.
+    # Read sequential function pointers and name them ClassName::Func1, Func2, etc.
+    handled_labels = set()
+    for vt in VTABLES:
+        class_short = vt[1].split('::')[-1]
+        handled_labels.add('VTABLE_' + class_short)
+    text_block = memory.getBlock('.text')
+    unnamed_named = 0
+    unnamed_walked = 0
+    if text_block:
+        text_start = text_block.getStart().getOffset()
+        text_end = text_start + text_block.getSize()
+        for sym in sym_table.getAllSymbols(False):
+            sname = sym.getName()
+            if not sname.startswith('VTABLE_') or sname in handled_labels:
+                continue
+            class_short = sname[7:]  # strip 'VTABLE_'
+            vtbl_addr = sym.getAddress()
+            unnamed_walked += 1
+            slot_idx = 0
+            while True:
+                slot_idx += 1
+                try:
+                    ptr_addr = vtbl_addr.add((slot_idx - 1) * ptr_size)
+                    if ptr_size == 8:
+                        raw = memory.getLong(ptr_addr)
+                        if raw < 0:
+                            raw = raw + (1 << 64)
+                    else:
+                        raw = memory.getInt(ptr_addr) & 0xFFFFFFFF
+                    # Stop if pointer is outside .text section
+                    if raw < text_start or raw >= text_end:
+                        break
+                    func_addr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(raw)
+                    func = fm.getFunctionAt(func_addr)
+                    if not func:
+                        DisassembleCommand(func_addr, None, True).applyTo(currentProgram)
+                        func = fm.getFunctionAt(func_addr)
+                    if not func:
+                        break
+                    curr = func.getName()
+                    if not (curr.startswith('FUN_') or curr.startswith('sub_')):
+                        continue
+                    func_name = 'Func{}'.format(slot_idx)
+                    func.setName(class_short + '::' + func_name, SourceType.USER_DEFINED)
+                    cu = currentProgram.getListing().getCodeUnitAt(func_addr)
+                    if cu:
+                        cu.setComment(0, (
+                            'VTABLE ' + class_short + '::' + func_name + '\\n' +
+                            'Slot offset: +0x{:X}\\n'.format((slot_idx - 1) * ptr_size) +
+                            'Source: CommonLibSSE vtable walk (unnamed)'
+                        ))
+                    unnamed_named += 1
+                except Exception:
+                    break
+    print('Unnamed vtable walk: {} vtables walked, {} functions named'.format(
+        unnamed_walked, unnamed_named))
 
 
 def _import_fallback_symbols():
@@ -1738,6 +1887,27 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
     lines.append('SYMBOLS = ' + symbols_json)
     lines.append('')
 
+    # Upgrade fallback symbols that match vtable slots: change source to CommonLibSSE
+    # and add signature so they display correctly even if vtable walk fails at runtime.
+    _vtable_sigs = {}  # 'ClassName::MethodName' -> (ret, params)
+    for vt in vtable_structs.values():
+        class_short = vt['class_full_name'].split('::')[-1]
+        for _off, slot_name, slot_ret, slot_params in vt['slots']:
+            if not slot_name.startswith('fn_') and not slot_name.startswith('__'):
+                _vtable_sigs[class_short + '::' + slot_name] = (slot_ret, slot_params)
+    if fallback_symbols_json != '[]' and _vtable_sigs:
+        import json as _json_mod
+        _fb = _json_mod.loads(fallback_symbols_json)
+        _upgraded = 0
+        for s in _fb:
+            sig_info = _vtable_sigs.get(s.get('n'))
+            if sig_info:
+                s['src'] = 'CommonLibSSE'
+                _upgraded += 1
+        if _upgraded:
+            print('  Upgraded {} vtable-known fallback symbols to CommonLibSSE source'.format(_upgraded))
+            fallback_symbols_json = _json_mod.dumps(_fb, separators=(',', ':'))
+
     # Fallback symbols (AE rename / SE PDB new entries) applied after vtable walk
     lines.append('FALLBACK_SYMBOLS = ' + fallback_symbols_json)
     lines.append('')
@@ -1751,9 +1921,10 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
         lines.append(template_source)
     else:
         lines.append('TEMPLATE_TYPE_MAP = {}')
+        lines.append('TEMPLATE_C_ALIAS_MAP = {}')
         lines.append('')
         lines.append('def _patch_templates(proto):')
-        lines.append('    for _tmpl, _alias in sorted(TEMPLATE_TYPE_MAP.items(), key=lambda x: -len(x[0])):')
+        lines.append('    for _tmpl, _alias in sorted(TEMPLATE_C_ALIAS_MAP.items(), key=lambda x: -len(x[0])):')
         lines.append('        proto = proto.replace(_tmpl, _alias)')
         lines.append('    return proto')
     lines.append('')
@@ -1875,6 +2046,10 @@ def _merge_pdb_into_structs(structs, pdb_types):
             structs_by_short[short] = st
 
     for pdb_name, pdb_info in pdb_types.items():
+        # Skip template types for struct cross-referencing — they're only used
+        # for enriching field type names, not for matching clang structs.
+        if '<' in pdb_name:
+            continue
         short = pdb_name.split('::')[-1]
         clang_key = pdb_name if pdb_name in structs else short if short in structs else None
         if clang_key is None:
@@ -1895,20 +2070,34 @@ def _merge_pdb_into_structs(structs, pdb_types):
             # Pass structs_by_short so field types can be inferred from known struct sizes.
             clang['size'] = pdb_sz
             clang['fields'] = _pdb_fields_to_clang(pdb_fields, pdb_sz, structs_by_short)
+            # Enrich PDB fields with clang type hints (clang knows types even
+            # when it can't compute offsets for incomplete types)
+            hints = clang.get('field_type_hints', {})
+            if hints:
+                for f in clang['fields']:
+                    if f['type'].startswith('bytes:') or f['type'] == 'ptr':
+                        hint = hints.get(f['name'])
+                        if hint:
+                            f['type'] = hint
             supplemented += 1
 
         elif clang['size'] == pdb_sz and pdb_sz > 1:
             size_ok += 1
-            # Sizes match — fill PDB field names only where libclang has no name at that offset.
-            # libclang names come directly from C++ source so they always take priority; PDB is
-            # a fallback for offsets libclang couldn't resolve.
+            # Sizes match — fill PDB field names and template types where libclang is incomplete.
             clang_field_map = {f['offset']: f for f in clang['fields']}
             for entry in pdb_fields:
                 pdb_fname, pdb_foff = entry[0], entry[1]
+                pdb_type_name = entry[2] if len(entry) > 2 else ''
                 if pdb_foff in clang_field_map:
-                    existing = clang_field_map[pdb_foff]['name']
-                    if not existing:
-                        clang_field_map[pdb_foff]['name'] = pdb_fname
+                    f = clang_field_map[pdb_foff]
+                    if not f['name']:
+                        f['name'] = pdb_fname
+                    # Enrich field type with PDB template info when clang has generic type
+                    if pdb_type_name and '<' in pdb_type_name:
+                        cur_type = f['type']
+                        if cur_type.startswith('bytes:') or cur_type == 'ptr' or \
+                           (cur_type.startswith('struct:') and '<' not in cur_type):
+                            f['type'] = 'struct:' + pdb_type_name
 
         elif clang['size'] == 1 and pdb_sz == 1:
             # Both sides report size 1: forward declaration, empty tag struct, or enum.
@@ -1947,8 +2136,12 @@ def _pdb_fields_to_clang(pdb_fields, total_size, structs_by_short=None):
 
         ftype = 'bytes:{}'.format(fsize)
 
+        # Priority 0: PDB type name is a template instantiation — use directly
+        if pdb_type_name and '<' in pdb_type_name:
+            ftype = 'struct:' + pdb_type_name
+
         # Priority 1: use PDB type name if it refers to a known struct/enum
-        if pdb_type_name and structs_by_short:
+        elif pdb_type_name and structs_by_short:
             short = pdb_type_name.split('::')[-1].strip()
             if short in structs_by_short:
                 cand = structs_by_short[short]
@@ -2541,12 +2734,16 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                         })
 
             elif var_name.startswith(('RTTI_', 'VTABLE_')):
-                # Always use forward-tokenization: reads the actual initializer source
-                # directly, avoiding the false-positive array-size INTEGER_LITERAL that
-                # appears as an AST child of std::array<REL::ID,N> VAR_DECLs.
+                # Try forward-tokenization first (reads past cursor extent).
                 ids = get_ints_from_cursor_forward(cursor)
                 if not ids:
                     ids = get_int_literals(cursor)
+                    # For std::array<REL::ID, N> VTABLE_ vars, get_int_literals
+                    # picks up the array size N as the first integer — skip it.
+                    type_sp = cursor.type.spelling
+                    if (var_name.startswith('VTABLE_')
+                            and 'array' in type_sp and len(ids) > 1):
+                        ids = ids[1:]
                 if ids:
                     the_id = ids[0]
                     if is_ae:
@@ -2747,10 +2944,58 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
     # Optional: scan for C++ template instantiation types and extend the prelude
     try:
         from template_types import process_template_types as _process_templates
-        _tmpl = _process_templates(structs, extra_types=extra)
-        if _tmpl.c_prelude_fragment:
-            c_prelude = c_prelude + '\n' + _tmpl.c_prelude_fragment
+        _tmpl = _process_templates(structs)
+        # NOTE: Do NOT append _tmpl.c_prelude_fragment to c_prelude — the template
+        # alias structs are created as Ghidra DataTypes (struct shells) so
+        # CParserUtils can resolve them via the DataTypeManager.  Putting 1200+
+        # forward declarations in C_TYPE_PRELUDE makes it ~280KB which causes
+        # Ghidra's C parser to fail on every prototype.
         template_source = _tmpl.combined_source()
+        # Add template types to structs so they get created as Ghidra DataTypes.
+        # template_map: original → display name (RE:: stripped)
+        # Populate fields from PDB where available, flattening base class fields.
+        _pdb = pdb_types if os.path.isfile(pdb_path) else {}
+        _sbs = {st['name']: st for st in structs.values() if st['size'] > 1}
+
+        def _flatten_pdb_fields(pdb_name, pdb_db, depth=0):
+            """Recursively collect fields from a PDB type and its bases."""
+            if depth > 10:
+                return []
+            entry = pdb_db.get(pdb_name)
+            if not entry:
+                return []
+            collected = {}  # offset → (name, offset, type_name)
+            # First, pull in base class fields at their base offsets
+            for base_name, base_off in entry.get('bases', []):
+                for bf in _flatten_pdb_fields(base_name, pdb_db, depth + 1):
+                    abs_off = base_off + bf[1]
+                    if abs_off not in collected:
+                        collected[abs_off] = (bf[0], abs_off, bf[2] if len(bf) > 2 else '')
+            # Own fields override bases at the same offset
+            for f in entry.get('fields', []):
+                fname, foff = f[0], f[1]
+                ftype = f[2] if len(f) > 2 else ''
+                collected[foff] = (fname, foff, ftype)
+            return sorted(collected.values(), key=lambda x: x[1])
+
+        for _orig, _display in _tmpl.template_map.items():
+            if _display not in structs and _display not in enums:
+                _sz = 0
+                _fields = []
+                # Look up the original template name in PDB types for size + fields
+                pdb_entry = _pdb.get(_orig) or _pdb.get('RE::' + _orig)
+                _pdb_name = _orig if _orig in _pdb else ('RE::' + _orig if 'RE::' + _orig in _pdb else None)
+                if pdb_entry:
+                    _sz = pdb_entry.get('size', 0)
+                    if _sz > 0 and _pdb_name:
+                        flat = _flatten_pdb_fields(_pdb_name, _pdb)
+                        if flat:
+                            _fields = _pdb_fields_to_clang(flat, _sz, _sbs)
+                structs[_display] = {'name': _display, 'full_name': _display, 'size': _sz,
+                                     'category': category, 'fields': _fields, 'bases': [],
+                                     'has_vtable': False}
+        if _tmpl.template_map:
+            print('Discovered {} template instantiation aliases'.format(len(_tmpl.template_map)))
     except ImportError:
         template_source = ''
 
@@ -2941,11 +3186,22 @@ def main():
     print('  Primary: {}, Fallback (AE rename / SE PDB new): {}'.format(
         len(primary_symbols), len(fallback_symbols)))
 
-    symbols_json          = _json.dumps(primary_symbols,  separators=(',', ':'))
-    fallback_symbols_json = _json.dumps(fallback_symbols, separators=(',', ':'))
+    symbols_json = _json.dumps(primary_symbols, separators=(',', ':'))
+
+    # Build per-version fallback lists:
+    # SE gets only SkyrimSE.pdb entries (skip skyrimae.rename-sourced symbols)
+    # AE gets only skyrimae.rename entries (skip SkyrimSE.pdb-sourced symbols)
+    se_fallback = [s for s in fallback_symbols if s.get('src') == 'SkyrimSE.pdb']
+    ae_fallback = [s for s in fallback_symbols if s.get('src') == 'skyrimae.rename']
+    print('  SE fallback: {} (PDB), AE fallback: {} (rename DB)'.format(
+        len(se_fallback), len(ae_fallback)))
+
+    se_fallback_json = _json.dumps(se_fallback, separators=(',', ':'))
+    ae_fallback_json = _json.dumps(ae_fallback, separators=(',', ':'))
 
     for version in ('se', 'ae'):
-        run_version(version, symbols_json, fallback_symbols_json)
+        fb_json = se_fallback_json if version == 'se' else ae_fallback_json
+        run_version(version, symbols_json, fb_json)
 
 
 if __name__ == '__main__':
