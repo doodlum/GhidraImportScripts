@@ -1157,6 +1157,15 @@ def convert_sig_to_ghidra(sig, func_name):
 
     sig = ' '.join(sig.split())
 
+    # Strip any leading `typedef ...;` declarations. CommonLibSSE occasionally
+    # embeds nested typedefs in extracted function-body signatures, which would
+    # otherwise end up concatenated into the return-type token we emit to
+    # Ghidra's C parser.
+    while True:
+        _m_td = re.match(r'\\s*typedef\\s+[^;]+;\\s*', sig)
+        if not _m_td: break
+        sig = sig[_m_td.end():]
+
     sig = re.sub(r'^//\\s*[0-9A-Fa-f]+\\s*', '', sig)
     sig = re.sub(r'^//\\s*', '', sig)
     sig = re.sub(r'\\s*//[^\\n]*', '', sig)
