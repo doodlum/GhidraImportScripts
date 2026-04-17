@@ -394,6 +394,95 @@ _SymTagUDT       = 11
 _SymTagBaseClass = 18
 _LocIsThisRel    = 4
 
+_TMPL_WS_RE = re.compile(r'\s+(?=[>,])|(?<=[<,])\s+')
+
+def _norm_tmpl(s):
+    """Normalise C++ template type name whitespace for consistent key matching.
+
+    DIA produces 'Type >' (space before '>') while libclang canonical spellings
+    use 'Type>, NextType' (space after ',').  Removing both variants gives a
+    single canonical form for dict key lookups.
+    """
+    return _TMPL_WS_RE.sub('', s) if s else s
+
+
+def _parse_tmpl(name):
+    """Split 'Outer<A,B>' into ('Outer', ['A', 'B']).  Returns (name, []) for non-templates."""
+    lt = name.find('<')
+    if lt < 0 or not name.endswith('>'):
+        return name, []
+    outer = name[:lt]
+    inner = name[lt + 1:-1]
+    args, depth, start = [], 0, 0
+    for i, c in enumerate(inner):
+        if c == '<':
+            depth += 1
+        elif c == '>':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            a = inner[start:i].strip()
+            if a:
+                args.append(a)
+            start = i + 1
+    a = inner[start:].strip()
+    if a:
+        args.append(a)
+    return outer, args
+
+
+def _tmpl_arg_fuzzy_eq(lc, pdb):
+    """True if lc matches pdb, tolerating a missing leading 'RE::' on lc and/or
+    trailing default template arguments present in pdb but absent in lc."""
+    if lc == pdb:
+        return True
+    if 'RE::' + lc == pdb:
+        return True
+    lc_o, lc_a = _parse_tmpl(lc)
+    pdb_o, pdb_a = _parse_tmpl(pdb)
+    if lc_o != pdb_o and 'RE::' + lc_o != pdb_o:
+        return False
+    if len(lc_a) > len(pdb_a):
+        return False
+    return all(_tmpl_arg_fuzzy_eq(la, pa) for la, pa in zip(lc_a, pdb_a))
+
+
+def _pdb_fuzzy_lookup(orig, pdb_types):
+    """Find a PDB type entry for orig using fuzzy template argument matching.
+
+    Accepts orig with missing 'RE::' on inner args and/or missing trailing
+    default args that the PDB expands.  When multiple candidates match,
+    picks the shortest PDB name (fewest extra defaults).
+
+    Returns (pdb_key, pdb_info) or (None, None).
+    """
+    lc_o, lc_a = _parse_tmpl(orig)
+    if not lc_a:
+        return None, None
+    prefix = lc_o + '<'
+    candidates = []
+    for k, v in pdb_types.items():
+        if not k.startswith(prefix):
+            continue
+        pdb_o, pdb_a = _parse_tmpl(k)
+        if len(lc_a) > len(pdb_a):
+            continue
+        if all(_tmpl_arg_fuzzy_eq(la, pa) for la, pa in zip(lc_a, pdb_a)):
+            candidates.append((k, v))
+    if not candidates:
+        return None, None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Multiple candidates: only accept if all agree on size, otherwise ambiguous
+    sizes = {v['size'] for _, v in candidates}
+    if len(sizes) > 1:
+        return None, None
+    # Same size — pick the one with fewest extra args, then shortest name
+    candidates.sort(key=lambda kv: (len(_parse_tmpl(kv[0])[1]) - len(lc_a), len(kv[0])))
+    return candidates[0]
+
+
+from template_structural_rules import structural_rule as _structural_rule
+
 
 def _find_msdia_dll():
     """Locate msdia140.dll — checks VS, PIX, and the registry CLSID path."""
@@ -509,7 +598,7 @@ def _load_pdb_types_dia(pdb_path):
 
     for sym in _dia_iter(scope.findChildren(_SymTagUDT, None, 0)):
         try:
-            name = sym.name
+            name = _norm_tmpl(sym.name)
         except Exception:
             continue
         if not name or not name.startswith('RE::'):
@@ -527,7 +616,7 @@ def _load_pdb_types_dia(pdb_path):
                 try:
                     if fsym.locationType == _LocIsThisRel:
                         try:
-                            type_name = fsym.type.name or ''
+                            type_name = _norm_tmpl(fsym.type.name or '')
                         except Exception:
                             type_name = ''
                         fields.append((fsym.name, fsym.offset, type_name))
@@ -540,7 +629,7 @@ def _load_pdb_types_dia(pdb_path):
         try:
             for bsym in _dia_iter(sym.findChildren(_SymTagBaseClass, None, 0)):
                 try:
-                    bases.append((bsym.type.name, bsym.offset))
+                    bases.append((_norm_tmpl(bsym.type.name), bsym.offset))
                 except Exception:
                     pass
         except Exception:
@@ -2982,15 +3071,38 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
             if _display not in structs and _display not in enums:
                 _sz = 0
                 _fields = []
-                # Look up the original template name in PDB types for size + fields
-                pdb_entry = _pdb.get(_orig) or _pdb.get('RE::' + _orig)
-                _pdb_name = _orig if _orig in _pdb else ('RE::' + _orig if 'RE::' + _orig in _pdb else None)
+                # Look up the original template name in PDB types for size + fields.
+                # Normalise whitespace so DIA ("Type >") and libclang ("Type>,") keys match.
+                _orig_n = _norm_tmpl(_orig)
+                _orig_re = 'RE::' + _orig_n
+                pdb_entry = _pdb.get(_orig_n) or _pdb.get(_orig_re)
+                _pdb_name = _orig_n if _orig_n in _pdb else (_orig_re if _orig_re in _pdb else None)
+                if not pdb_entry:
+                    # Exact lookup failed — try fuzzy match for missing RE:: / default args
+                    _fuzz_key, pdb_entry = _pdb_fuzzy_lookup(_orig_n, _pdb)
+                    if pdb_entry:
+                        _pdb_name = _fuzz_key
                 if pdb_entry:
                     _sz = pdb_entry.get('size', 0)
                     if _sz > 0 and _pdb_name:
                         flat = _flatten_pdb_fields(_pdb_name, _pdb)
                         if flat:
                             _fields = _pdb_fields_to_clang(flat, _sz, _sbs)
+                        elif _sz > 0:
+                            # No own fields but has size — bases carry the layout;
+                            # store size so Ghidra creates a correctly-sized shell.
+                            pass
+                # Structural rules provide typed pointer info that PDB lacks.
+                # Use structural fields when they exist and agree on size with PDB,
+                # or as sole source when PDB lookup failed entirely.
+                _known_sz = {k: v['size'] for k, v in structs.items() if v.get('size', 0) > 0}
+                _known_sz.update({k: v.get('size', 0) for k, v in enums.items() if v.get('size', 0) > 0})
+                _rule_sz, _rule_fields = _structural_rule(_orig_n, _known_sz)
+                if _rule_sz:
+                    if not _sz:
+                        _sz, _fields = _rule_sz, _rule_fields
+                    elif _rule_sz == _sz:
+                        _fields = _rule_fields
                 structs[_display] = {'name': _display, 'full_name': _display, 'size': _sz,
                                      'category': category, 'fields': _fields, 'bases': [],
                                      'has_vtable': False}
