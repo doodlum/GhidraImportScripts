@@ -5,3 +5,6 @@ plugin/build*/
 /pdbs
 /__pycache__
 /ghidrascripts
+/ghidra_12.0.4_PUBLIC
+.DS_Store
+SkyrimSE.exe
