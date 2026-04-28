@@ -295,11 +295,12 @@ def _scan_label_files(
         for m in _VTABLE_ARRAY_RE.finditer(content):
             name     = m.group(2)
             id_calls = [int(x) for x in _REL_ID_CALL_RE.findall(m.group(3))]
-            if not id_calls:
-                continue
-            ae_off = addr_lib.get_ae(id_calls[0])
-            if ae_off:
-                lname = 'VTABLE_' + name
+            for idx, id_ in enumerate(id_calls):
+                ae_off = addr_lib.get_ae(id_)
+                if not ae_off:
+                    continue
+                suffix = '' if idx == 0 else '_{}'.format(idx + 1)
+                lname = 'VTABLE_' + name + suffix
                 labels.setdefault(lname, {'name': lname, 'ae_off': ae_off})
 
     return list(labels.values())

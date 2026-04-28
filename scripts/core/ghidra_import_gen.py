@@ -1003,11 +1003,20 @@ def _import_vtable_names():
     if text_block:
         text_start = text_block.getStart().getOffset()
         text_end = text_start + text_block.getSize()
+        # match "FOO" or "FOO_N" where N is the secondary vtable index (2..)
+        sec_re = re.compile(r'^(.+?)_(\\d+)$')
         for sym in sym_table.getAllSymbols(False):
             sname = sym.getName()
             if not sname.startswith('VTABLE_') or sname in handled_labels:
                 continue
-            class_short = sname[7:]
+            label_short = sname[7:]
+            sec_match = sec_re.match(label_short)
+            if sec_match:
+                class_short = sec_match.group(1)
+                sec_suffix  = '_v' + sec_match.group(2)
+            else:
+                class_short = label_short
+                sec_suffix  = ''
             vtbl_addr = sym.getAddress()
             unnamed_walked += 1
             slot_idx = 0
@@ -1033,7 +1042,7 @@ def _import_vtable_names():
                     curr = func.getName()
                     if not (curr.startswith('FUN_') or curr.startswith('sub_')):
                         continue
-                    func_name = 'Func{}'.format(slot_idx)
+                    func_name = 'Func{}{}'.format(slot_idx, sec_suffix)
                     func.setName(class_short + '::' + func_name, SourceType.USER_DEFINED)
                     cu = currentProgram.getListing().getCodeUnitAt(func_addr)
                     if cu:

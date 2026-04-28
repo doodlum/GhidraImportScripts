@@ -185,9 +185,14 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
   `vfuncs` for ~95% of polymorphic classes, fixing destructor-position
   miscounts that previously truncated vtable structs (e.g. F4 `Actor_vtbl`:
   299 → 307 components).
-  Multi-vtable secondaries from multi-inheritance (`VFTable for B in C`) are
-  parsed but not yet injected — that needs a runtime model for multiple
-  vfptr fields per class.
+  Secondary vtable IDs from multi-inheritance — `std::array<REL::ID, N>`
+  arrays in `IDs_VTABLE.h` / `Offsets_VTABLE.h` with N > 1 — are now emitted
+  as `VTABLE_<Class>_2`, `VTABLE_<Class>_3`, ... so all of a class's vtables
+  get labeled. The unnamed-walk pass labels their slot functions as
+  `Class::Func1_v2`, `Class::Func2_v2`, etc. Typed secondary vtable struct
+  fields per inheritance branch (`VFTable for B in C`) are not yet injected
+  — that needs a per-(C, B) struct generator and base-offset-aware vfptr
+  field rewrites.
 - **Type resolution in signatures.** Most `void *` fallbacks have been removed
   by extracting `using X = Y;` aliases from the AST and rewriting
   descriptors to canonical form, plus stripping `const`/`volatile` and

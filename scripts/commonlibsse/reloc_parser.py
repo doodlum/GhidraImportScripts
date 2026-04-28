@@ -506,22 +506,26 @@ def _scan_rtti_vtable_file(
                 labels[name]['se_off'] = off
 
         for m in _VTABLE_RE.finditer(ae_text):
-            name = m.group(2)
+            base_name = m.group(2)
             ids = [int(x) for x in _REL_ID_RE.findall(m.group(3))]
-            if ids:
-                off = addr_lib.ae_db.get(ids[0])
-                if off:
-                    labels.setdefault(name, {'name': name, 'se_off': None, 'ae_off': None})
-                    labels[name]['ae_off'] = off
+            for idx, id_ in enumerate(ids):
+                off = addr_lib.ae_db.get(id_)
+                if not off:
+                    continue
+                lname = base_name if idx == 0 else '{}_{}'.format(base_name, idx + 1)
+                labels.setdefault(lname, {'name': lname, 'se_off': None, 'ae_off': None})
+                labels[lname]['ae_off'] = off
 
         for m in _VTABLE_RE.finditer(se_text):
-            name = m.group(2)
+            base_name = m.group(2)
             ids = [int(x) for x in _REL_ID_RE.findall(m.group(3))]
-            if ids:
-                off = addr_lib.se_db.get(ids[0])
-                if off:
-                    labels.setdefault(name, {'name': name, 'se_off': None, 'ae_off': None})
-                    labels[name]['se_off'] = off
+            for idx, id_ in enumerate(ids):
+                off = addr_lib.se_db.get(id_)
+                if not off:
+                    continue
+                lname = base_name if idx == 0 else '{}_{}'.format(base_name, idx + 1)
+                labels.setdefault(lname, {'name': lname, 'se_off': None, 'ae_off': None})
+                labels[lname]['se_off'] = off
     else:
         for m in _RTTI_RE.finditer(content):
             name = m.group(1)
@@ -531,13 +535,15 @@ def _scan_rtti_vtable_file(
                 labels[name]['se_off'] = off
 
         for m in _VTABLE_RE.finditer(content):
-            name = m.group(2)
+            base_name = m.group(2)
             ids = [int(x) for x in _REL_ID_RE.findall(m.group(3))]
-            if ids:
-                off = addr_lib.se_db.get(ids[0])
-                if off:
-                    labels.setdefault(name, {'name': name, 'se_off': None, 'ae_off': None})
-                    labels[name]['se_off'] = off
+            for idx, id_ in enumerate(ids):
+                off = addr_lib.se_db.get(id_)
+                if not off:
+                    continue
+                lname = base_name if idx == 0 else '{}_{}'.format(base_name, idx + 1)
+                labels.setdefault(lname, {'name': lname, 'se_off': None, 'ae_off': None})
+                labels[lname]['se_off'] = off
 
     return list(labels.values())
 
