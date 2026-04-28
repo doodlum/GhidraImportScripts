@@ -59,7 +59,7 @@ def find_clang_binary():
 # ---------------------------------------------------------------------------
 
 _CLANG_TYPE_MAP = {
-    'bool': 'bool',
+    'bool': 'bool', '_Bool': 'bool',
     'char': 'i8', 'signed char': 'i8', 'unsigned char': 'u8',
     'short': 'i16', 'signed short': 'i16', 'unsigned short': 'u16',
     'int': 'i32', 'signed int': 'i32', 'unsigned int': 'u32',
@@ -68,6 +68,13 @@ _CLANG_TYPE_MAP = {
     '__int64': 'i64', 'unsigned __int64': 'u64',
     'float': 'f32', 'double': 'f64',
     'void': 'void',
+    # C/C++ wide & UTF char types (Windows: wchar_t = 16-bit)
+    'wchar_t':  'u16',
+    'char16_t': 'u16',
+    'char32_t': 'u32',
+    'char8_t':  'u8',
+    # std::byte is enum class byte : unsigned char {} — pure 1-byte storage
+    'std::byte': 'u8', 'byte': 'u8',
     'std::uint8_t': 'u8', 'uint8_t': 'u8',
     'std::uint16_t': 'u16', 'uint16_t': 'u16',
     'std::uint32_t': 'u32', 'uint32_t': 'u32',
@@ -83,16 +90,20 @@ _CLANG_TYPE_MAP = {
 }
 
 _KW_STRIP_RE = re.compile(r'\b(?:class|struct|union|enum)\s+')
-_CV_STRIP_RE = re.compile(r'\b(?:const|volatile|restrict)\s+|\s+(?:const|volatile|restrict)\b')
+# Match the keyword anywhere as a whole word — covers `const T`, `T const`, and
+# `T *const` (where `*` is non-word so `\b` lies between it and `c`).
+_CV_STRIP_RE = re.compile(r'\b(?:const|volatile|restrict)\b')
 
 _PRIM_BARE = frozenset({
-    'void', 'bool', 'char', 'wchar_t', 'float', 'double', 'auto',
+    'void', 'bool', '_Bool', 'char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t',
+    'float', 'double', 'auto',
     'short', 'int', 'long',
-    'signed', 'unsigned', '__int64', '__int32', '__int16', '__int8',
+    'signed', 'unsigned', '__int64', '__int32', '__int16', '__int8', '__int128',
     'nullptr_t',
     'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
     'int8_t', 'int16_t', 'int32_t', 'int64_t',
     'size_t', 'ptrdiff_t', 'uintptr_t', 'intptr_t',
+    'byte',
 })
 
 _PRIM_MULTI = frozenset({
@@ -1334,7 +1345,7 @@ def _dump_vtable_layouts(structs, header_path, parse_args, clang_binary,
             candidates.append((k, m))
 
     if not candidates:
-        return {}
+        return {}, {}
 
     header_fwd = header_path.replace('\\', '/')
     tmp_dir = tempfile.mkdtemp(prefix='ghidra_vt_dump_')
@@ -1371,7 +1382,7 @@ def _dump_vtable_layouts(structs, header_path, parse_args, clang_binary,
             print('  filtered {} bad address-takes; {} candidates remain'.format(
                 len(candidates) - len(cleaned), len(cleaned)))
         if not cleaned:
-            return {}
+            return {}, {}
 
         # Stage 2: emit-llvm with vtable layout dump
         with open(spath_clean, 'w', encoding='utf-8') as f:
@@ -1385,7 +1396,7 @@ def _dump_vtable_layouts(structs, header_path, parse_args, clang_binary,
         if r.returncode != 0 and not r.stdout:
             if verbose:
                 print('  clang vtable codegen failed; skipping enrichment')
-            return {}
+            return {}, {}
     finally:
         for p in (spath_dry, spath_clean):
             try:
@@ -1436,6 +1447,103 @@ def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
     if verbose and replaced:
         print('Replaced vfuncs with clang vtable dump for {} classes'.format(replaced))
     return replaced
+
+
+_OPAQUE_NAME_RE   = re.compile(r'^[A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*$')
+_OPAQUE_BAD_FRAGS = ('__attribute__', '*const', '*volatile', 'unnamed', 'lambda',
+                     'anonymous', '$')
+
+
+def _is_opaque_safe_name(name: str) -> bool:
+    """Reject names that aren't safe to materialise as opaque structs."""
+    if not name:
+        return False
+    if any(s in name for s in _OPAQUE_BAD_FRAGS):
+        return False
+    # Single-letter uppercase typically denotes uninstantiated template params (T, K, V).
+    last = name.split('::')[-1]
+    if len(last) == 1 and last.isupper():
+        return False
+    if not _OPAQUE_NAME_RE.match(name):
+        return False
+    return True
+
+
+def _collect_descriptor_refs(structs):
+    """Walk every descriptor in structs.fields/vmethods/methods and collect
+    every ``struct:`` / ``enum:`` name referenced (recursing through ptr/arr
+    wrappers).  Used by the opaque-struct generator.
+    """
+    refs = set()
+
+    def visit(t):
+        if not t:
+            return
+        if t.startswith('ptr:'):
+            visit(t[4:]); return
+        if t.startswith('arr:'):
+            rest = t[4:]
+            last = rest.rfind(':')
+            if last > 0 and rest[last+1:].isdigit():
+                visit(rest[:last]); return
+        if t.startswith('struct:') or t.startswith('enum:'):
+            refs.add(t.split(':', 1)[1])
+
+    for st in structs.values():
+        for f in st.get('fields', []):
+            visit(f.get('type', ''))
+        for ret, params in st.get('vmethods', {}).values():
+            visit(ret)
+            for _pn, pt in params:
+                visit(pt)
+        for ret, params, _is_static in st.get('methods', {}).values():
+            visit(ret)
+            for _pn, pt in params:
+                visit(pt)
+    return refs
+
+
+def _add_opaque_for_forward_decls(structs, enums, root_ns, category_prefix, verbose=False):
+    """Generate 0-byte opaque struct entries for any name that's referenced
+    in a descriptor but neither defined in ``structs`` nor present as an
+    enum.  This converts ``void *`` fallbacks into typed pointers in Ghidra
+    for forward-declared external types (Havok ``hk*``, ``REX::W32::*``,
+    nested types inside templates, etc.).
+    """
+    referenced = _collect_descriptor_refs(structs)
+
+    existing_short_struct = {st['name'] for st in structs.values()}
+    existing_short_enum   = {e.split('::')[-1] for e in enums}
+    added = 0
+    for name in sorted(referenced):
+        # Skip templates — those are handled by the template_map machinery.
+        if '<' in name:
+            continue
+        if name in structs or name in enums:
+            continue
+        short = name.split('::')[-1]
+        if short in existing_short_struct or short in existing_short_enum:
+            continue
+        if not _is_opaque_safe_name(name):
+            continue
+        ns_parts = name.split('::')[:-1]
+        if ns_parts:
+            category = category_prefix + '/' + '/'.join(ns_parts)
+        else:
+            category = category_prefix
+        structs[name] = {
+            'name':       name.split('::')[-1],
+            'full_name':  name,
+            'size':       0,
+            'category':   category,
+            'fields':     [],
+            'bases':      [],
+            'has_vtable': False,
+        }
+        added += 1
+    if verbose and added:
+        print('Added {} opaque struct entries for forward-declared types'.format(added))
+    return added
 
 
 def _store_vtable_secondaries(structs, secondary_layouts, verbose=False):
@@ -1693,7 +1801,12 @@ def collect_types(header_path, include_path, parse_args,
         template_source = tmpl.map_source
 
         _created = 0
+        _skipped = 0
         for _orig, _display in tmpl.template_map.items():
+            # Skip clang-internal lambda-numbered names (e.g. 'Allocator<24, RE::8>')
+            if not _is_safe_template_name(_display):
+                _skipped += 1
+                continue
             if _display not in structs and _display not in enums:
                 structs[_display] = {
                     'name': _display, 'full_name': _display, 'size': 0,
@@ -1702,8 +1815,9 @@ def collect_types(header_path, include_path, parse_args,
                 }
                 _created += 1
         if tmpl.template_map:
-            print('Discovered {} template instantiation aliases ({} new placeholders)'.format(
-                len(tmpl.template_map), _created))
+            extra = (' [{} unsafe names skipped]'.format(_skipped)) if _skipped else ''
+            print('Discovered {} template instantiation aliases ({} new placeholders){}'.format(
+                len(tmpl.template_map), _created, extra))
 
         _propagated = _propagate_template_layouts(structs)
         if _propagated:
@@ -1716,5 +1830,10 @@ def collect_types(header_path, include_path, parse_args,
             print('Forced layout for {} template instantiations via synthesis pass'.format(_forced))
     except ImportError:
         pass
+
+    # --- Generate opaque structs for forward-declared types still referenced ---
+    _add_opaque_for_forward_decls(
+        structs, enums, root_ns=root_namespace,
+        category_prefix=category_prefix, verbose=verbose)
 
     return enums, structs, template_source

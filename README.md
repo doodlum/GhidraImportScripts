@@ -200,13 +200,21 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
   B's primary, so multi-inheritance vfptr fields type-correctly per
   most-derived class.
 - **Type resolution in signatures.** Most `void *` fallbacks have been removed
-  by extracting `using X = Y;` aliases from the AST and rewriting
-  descriptors to canonical form, plus stripping `const`/`volatile` and
-  whitelisting `true`/`false`/`nullptr` as literal template arguments. Class-
-  local typedefs (e.g. `Foo::EventSource_t`) are resolved by passing each
-  struct's full name as `class_scope` when applying aliases. Remaining
-  unresolved cases are template parameter packs (`Args...`) and forward-
-  declared external types (Havok's `hk*`).
+  by:
+  - extracting `using X = Y;` aliases from the AST and rewriting descriptors
+    to canonical form (with each struct's `full_name` as `class_scope` so
+    class-local typedefs like `Foo::EventSource_t` resolve too);
+  - stripping `const`/`volatile`/`restrict` (including the `T *const` case);
+  - mapping `_Bool`, `std::byte`, `wchar_t`, `char16_t`, `char32_t`,
+    `char8_t`, `__int128` directly to primitives in `_CLANG_TYPE_MAP`;
+  - generating 0-byte opaque struct entries for any name still referenced as
+    `struct:NAME` but not present in `structs`/`enums` (Havok `hk*`,
+    `REX::W32::*`, nested types inside templates) — pointers to them
+    become typed in Ghidra instead of `void *`.
+
+  F4 result: unresolved field types dropped from 13.7% → 3.6%. Remaining
+  cases are template parameter packs (`Args...`), unspecialised template
+  parameters (`T`), and clang-attribute-syntax SIMD types (rare).
 - **Fallout 4 PDB coverage.** The shipped `Fallout4.pdb` only contains ~11.7k
   real public symbols (the rest are auto-named `FUN_*` placeholders, filtered
   out). The vast majority of named F4 functions therefore come from the
