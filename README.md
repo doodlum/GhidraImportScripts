@@ -168,14 +168,34 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
 
 ## Known limitations
 
-- **Template layouts.** clang's record-layout dump occasionally fails to
-  instantiate templates; those types ship as opaque placeholder structs.
-- **Vtable slots.** Computed from the clang AST's virtual-method declarations.
-  Diamond inheritance with shared virtual bases may produce incorrect indices,
-  and multi-vtable classes use only the primary vtable for the walk.
-- **Type resolution in signatures.** Ghidra's `CParserUtils.parseSignature()`
-  resolves names against the Data Type Manager; missing names are replaced
-  with `void *`.
+- **Template layouts.** A third clang pass (`-fdump-record-layouts` over a
+  synthetic `struct sN { T<...> _; }` for each unfilled template) forces
+  instantiation of templates the orchestrator header never used. ~95% of
+  empty placeholders get real layouts; the only stragglers are
+  malformed names from clang's lambda-numbering (e.g. `Allocator<24, RE::8>`).
+- **Vtable slots.** A 4th clang pass synthesises `auto u<N> = &Class::Method;`
+  (one per polymorphic class) and runs `-S -emit-llvm -Xclang
+  -fdump-vtable-layouts`, which yields exact slot indices for every primary
+  vtable. The address-of-virtual-member trick avoids destructor instantiation,
+  so it sidesteps the `BSTSmartPointer<incomplete-type>` and ambiguous
+  `operator delete` errors that block `delete t` / `t->~T()`.
+  A two-stage compile (`-fsyntax-only` to filter overload-ambiguous
+  declarations, then real codegen) recovers usable data even when the
+  candidate set has bad picks. The clang slot map replaces AST-computed
+  `vfuncs` for ~95% of polymorphic classes, fixing destructor-position
+  miscounts that previously truncated vtable structs (e.g. F4 `Actor_vtbl`:
+  299 → 307 components).
+  Multi-vtable secondaries from multi-inheritance (`VFTable for B in C`) are
+  parsed but not yet injected — that needs a runtime model for multiple
+  vfptr fields per class.
+- **Type resolution in signatures.** Most `void *` fallbacks have been removed
+  by extracting `using X = Y;` aliases from the AST and rewriting
+  descriptors to canonical form, plus stripping `const`/`volatile` and
+  whitelisting `true`/`false`/`nullptr` as literal template arguments. Class-
+  local typedefs (e.g. `Foo::EventSource_t`) are resolved by passing each
+  struct's full name as `class_scope` when applying aliases. Remaining
+  unresolved cases are template parameter packs (`Args...`) and forward-
+  declared external types (Havok's `hk*`).
 - **Fallout 4 PDB coverage.** The shipped `Fallout4.pdb` only contains ~11.7k
   real public symbols (the rest are auto-named `FUN_*` placeholders, filtered
   out). The vast majority of named F4 functions therefore come from the

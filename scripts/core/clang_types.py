@@ -83,6 +83,7 @@ _CLANG_TYPE_MAP = {
 }
 
 _KW_STRIP_RE = re.compile(r'\b(?:class|struct|union|enum)\s+')
+_CV_STRIP_RE = re.compile(r'\b(?:const|volatile|restrict)\s+|\s+(?:const|volatile|restrict)\b')
 
 _PRIM_BARE = frozenset({
     'void', 'bool', 'char', 'wchar_t', 'float', 'double', 'auto',
@@ -125,6 +126,9 @@ def _split_tmpl_args(inner):
     return args
 
 
+_LITERAL_KEYWORDS = frozenset({'true', 'false', 'nullptr', 'this'})
+
+
 def _ensure_qualified(name, root_ns='RE'):
     """Prepend root_ns:: to bare identifiers. Already-qualified names are unchanged."""
     name = name.strip()
@@ -134,7 +138,13 @@ def _ensure_qualified(name, root_ns='RE'):
         return name
     if name in _PRIM_ALL:
         return name
-    if re.fullmatch(r'[+-]?[0-9]+(?:\.[0-9]*)?[uUlLfF]*', name):
+    if name in _LITERAL_KEYWORDS:
+        return name
+    # Numeric literals: int, float, hex, octal — with optional sign and suffix
+    if re.fullmatch(r"[+-]?(?:0[xX][0-9A-Fa-f]+|[0-9]+(?:\.[0-9]*)?)[uUlLfFeE0-9+\-]*", name):
+        return name
+    # Character or string literal
+    if (name.startswith("'") and name.endswith("'")) or (name.startswith('"') and name.endswith('"')):
         return name
     return root_ns + '::' + name
 
@@ -196,10 +206,15 @@ def _qualify_type(name, root_ns='RE'):
 def _record_type_to_pipeline(raw, root_ns='RE'):
     """Convert a raw clang type string to a pipeline type descriptor."""
     raw = _KW_STRIP_RE.sub('', raw.strip()).strip()
+    # Drop cv-qualifiers — they don't affect the underlying type or layout.
+    raw = _CV_STRIP_RE.sub(' ', raw).strip()
+    raw = re.sub(r'\s+', ' ', raw)
     if raw.endswith('*') or raw.endswith('&'):
         pointee = raw[:-1].strip()
         inner = _record_type_to_pipeline(pointee, root_ns)
         if inner.startswith('struct:') or inner.startswith('enum:'):
+            return 'ptr:' + inner
+        if inner in ('i8','u8','i16','u16','i32','u32','i64','u64','f32','f64','bool','void'):
             return 'ptr:' + inner
         return 'ptr'
     if raw in _CLANG_TYPE_MAP:
@@ -332,6 +347,7 @@ def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/Commo
     """
     enums = {}
     ast_classes = {}
+    aliases = {}  # alias_full_name -> canonical_full_name (for `using X = Y;`)
 
     re_path_fwd = re_include_path.replace('\\', '/')
 
@@ -439,6 +455,29 @@ def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/Commo
                 last_enum_value = int(m.group(1))
                 cur_enum['values'].append((pending_const_name, last_enum_value))
             pending_const_name = None
+            continue
+
+        # TypeAliasDecl / TypedefDecl - using X = Y;  or  typedef Y X;
+        # Format: TypeAliasDecl 0x... <loc> col:N AliasName 'Written':'Canonical'
+        # Canonical is what we want to point at.
+        if content.startswith('TypeAliasDecl ') or content.startswith('TypedefDecl '):
+            m = re.search(r"(?:TypeAliasDecl|TypedefDecl)\s+0x\w+\s+<[^>]*>\s+(?:<[^>]*>\s+)?(?:col:\d+\s+|line:\d+:\d+\s+)?(?:referenced\s+)?(?:implicit\s+)?(\w+)\s+'([^']*)'(?::'([^']*)')?", content)
+            if m and _is_re():
+                alias_short = m.group(1)
+                canonical   = (m.group(3) or m.group(2) or '').strip()
+                if alias_short and canonical:
+                    prefix = _qual_prefix()
+                    alias_full = prefix + '::' + alias_short if prefix else alias_short
+                    # Strip clang's noise: leading 'class '/'struct '/'enum ' keywords
+                    canonical = _KW_STRIP_RE.sub('', canonical).strip()
+                    canonical = _CV_STRIP_RE.sub(' ', canonical).strip()
+                    canonical = re.sub(r'\s+', ' ', canonical)
+                    # Skip pointer/array typedefs — they don't help with struct resolution
+                    if canonical and not canonical.endswith(('*', '&')):
+                        # Qualify template args so the canonical form matches struct keys
+                        canonical = _qualify_type(canonical, root_ns)
+                        if canonical != alias_full:
+                            aliases[alias_full] = canonical
             continue
 
         # CXXRecordDecl (class/struct definition)
@@ -560,7 +599,7 @@ def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/Commo
             cur_enum['values'].append((pending_const_name, last_enum_value))
         enums[cur_enum['full_name']] = cur_enum
 
-    return enums, ast_classes
+    return enums, ast_classes, aliases
 
 
 def _parse_method_sig(sig, root_ns='RE'):
@@ -972,6 +1011,426 @@ def _generalize_field(f):
     return f
 
 
+_TEMPLATE_NAME_BAD = re.compile(r'(?:^|::)\d')          # e.g. 'RE::8'
+_ANGLE_INNER       = re.compile(r'<[^<>]*>')
+
+
+def _is_safe_template_name(name: str) -> bool:
+    """Reject obviously malformed template names that would fail to compile.
+
+    Drops names like ``Allocator<24, RE::8>`` where a qualified path component
+    starts with a digit, or names containing illegal substrings (anonymous
+    structs, lambda mangles, etc.).
+    """
+    if any(s in name for s in ('(unnamed', '$', '(anonymous', '(lambda')):
+        return False
+    # Strip innermost template args and check qualified-name segments
+    stripped = name
+    while True:
+        new_stripped = _ANGLE_INNER.sub('', stripped)
+        if new_stripped == stripped:
+            break
+        stripped = new_stripped
+    if _TEMPLATE_NAME_BAD.search(stripped):
+        return False
+    return True
+
+
+def _resolve_aliases_in_descriptor(desc: str, alias_map, class_scope=None) -> str:
+    """Rewrite a pipeline type descriptor by following alias chains.
+
+    Handles ``struct:NAME`` (and pointer/array wrappers) by replacing NAME
+    with the canonical form when ``NAME`` appears in ``alias_map``.  Follows
+    chains (alias -> alias -> canonical) up to a depth limit.
+
+    When ``class_scope`` is provided, the resolver also tries
+    ``<class_scope>::<short>`` as a candidate key — this catches class-local
+    ``using X = Y;`` declarations whose short name escapes into method/field
+    descriptors without the class prefix.
+    """
+    if not desc or not alias_map:
+        return desc
+    if desc.startswith('ptr:'):
+        inner = _resolve_aliases_in_descriptor(desc[4:], alias_map, class_scope)
+        return 'ptr:' + inner if inner != desc[4:] else desc
+    if desc.startswith('arr:'):
+        rest = desc[4:]
+        last = rest.rfind(':')
+        if last < 0 or not rest[last + 1:].isdigit():
+            return desc
+        inner = _resolve_aliases_in_descriptor(rest[:last], alias_map, class_scope)
+        return 'arr:{}:{}'.format(inner, rest[last + 1:])
+    if desc.startswith('struct:') or desc.startswith('enum:'):
+        prefix, name = desc.split(':', 1)
+        # Try class-scope-qualified form first, so a method on RE::Foo that
+        # mentions a typedef declared in RE::Foo (which the AST emitted as
+        # `RE::TypedefName`) can hit the alias key `RE::Foo::TypedefName`.
+        if class_scope:
+            short = name.split('::')[-1]
+            scoped = class_scope + '::' + short
+            if scoped in alias_map and scoped != name:
+                name = scoped
+        seen = set()
+        while name in alias_map and name not in seen:
+            seen.add(name)
+            name = alias_map[name]
+        return prefix + ':' + name
+    return desc
+
+
+def _apply_aliases_to_structs(structs, alias_map, verbose=False):
+    """Walk every type descriptor in structs and apply alias resolution.
+
+    Each struct's own ``full_name`` is passed as the resolver's ``class_scope``
+    so class-local typedefs resolve correctly when their short name leaks into
+    the AST sig of one of that class's own methods.
+    """
+    if not alias_map:
+        return 0
+    rewrites = 0
+    for st in structs.values():
+        cls = st.get('full_name')
+        # Field types
+        for f in st.get('fields', []):
+            t0 = f.get('type', '')
+            t1 = _resolve_aliases_in_descriptor(t0, alias_map, class_scope=cls)
+            if t1 != t0:
+                f['type'] = t1
+                rewrites += 1
+        # vmethods: { name: (ret, params) }
+        for mname, info in list(st.get('vmethods', {}).items()):
+            ret, params = info
+            new_ret    = _resolve_aliases_in_descriptor(ret, alias_map, class_scope=cls)
+            new_params = [(pn, _resolve_aliases_in_descriptor(pt, alias_map, class_scope=cls))
+                          for pn, pt in params]
+            if new_ret != ret or new_params != params:
+                st['vmethods'][mname] = (new_ret, new_params)
+                rewrites += 1
+        # methods: { name: (ret, params, is_static) }
+        for mname, info in list(st.get('methods', {}).items()):
+            ret, params, is_static = info
+            new_ret    = _resolve_aliases_in_descriptor(ret, alias_map, class_scope=cls)
+            new_params = [(pn, _resolve_aliases_in_descriptor(pt, alias_map, class_scope=cls))
+                          for pn, pt in params]
+            if new_ret != ret or new_params != params:
+                st['methods'][mname] = (new_ret, new_params, is_static)
+                rewrites += 1
+    if verbose and rewrites:
+        print('Resolved {} type-alias references via {} aliases'.format(rewrites, len(alias_map)))
+    return rewrites
+
+
+_VTABLE_BAD_METHOD_PREFIX = ('~',)
+_OPERATOR_RE = re.compile(r'^operator\b')
+
+
+def _pick_virtual_method_for_addr(structs, full_name, root_ns, depth=0):
+    """Pick any visible virtual method name on a class that should be safe to
+    write as ``&Class::Method`` in synthetic source.
+
+    Skips destructors, operators, and names with non-identifier characters.
+    Walks the primary inheritance chain when the class itself only overrides.
+    """
+    if depth > 30:
+        return None
+    st = structs.get(full_name)
+    if not st:
+        return None
+    for vm in st.get('vmethods', {}):
+        if vm.startswith(_VTABLE_BAD_METHOD_PREFIX):
+            continue
+        if _OPERATOR_RE.match(vm):
+            continue
+        if not vm.replace('_', '').isalnum():
+            continue
+        return vm
+    for base in st.get('bases', []):
+        bs = structs.get(base) or structs.get(root_ns + '::' + base)
+        if bs:
+            r = _pick_virtual_method_for_addr(structs, bs['full_name'], root_ns, depth + 1)
+            if r:
+                return r
+        break  # only primary base
+    return None
+
+
+def _extract_vtable_method_name(sig: str):
+    """Extract the bare method name from a clang-vtable signature.
+
+    e.g. ``"void RE::Foo::Bar() const"`` -> ``"Bar"``
+         ``"RE::Foo::~Foo() [vector deleting]"`` -> ``"~Foo"``
+    """
+    if not sig:
+        return None
+    sig = re.sub(r'\s*\[(?:vector deleting|scalar deleting|pure)\]\s*$', '', sig).strip()
+    paren = sig.find('(')
+    if paren < 0:
+        return None
+    head = sig[:paren].strip()
+    tail = head.split('::')[-1].strip()
+    if tail.startswith('operator'):
+        return tail
+    if tail.startswith('~'):
+        return tail
+    m = re.match(r'(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)$', tail)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _parse_vtable_dump(text, root_ns):
+    """Parse clang ``-fdump-vtable-layouts`` text into per-class slot maps.
+
+    Returns dict ``full_name -> [(slot_index, method_name)]`` listing the
+    class's own (own + inherited) primary-vtable indices in order.
+    """
+    result = {}
+    cur = None
+    indices_re = re.compile(r"^VFTable indices for '([^']+)'")
+    full_re    = re.compile(r"^VFTable for ")
+    slot_re    = re.compile(r"^\s*(\d+)\s*\|\s*(.+?)\s*$")
+    for ln in text.splitlines():
+        if not ln.strip():
+            cur = None
+            continue
+        m = indices_re.match(ln)
+        if m:
+            cur = m.group(1)
+            result.setdefault(cur, [])
+            continue
+        if full_re.match(ln):
+            cur = None
+            continue
+        if cur is None:
+            continue
+        if ln.lstrip().startswith('--') or ln.lstrip().startswith('['):
+            continue
+        m_slot = slot_re.match(ln)
+        if not m_slot:
+            continue
+        sig = m_slot.group(2)
+        if sig.startswith('[') or 'this adjustment' in sig:
+            continue
+        name = _extract_vtable_method_name(sig)
+        if name:
+            result[cur].append((int(m_slot.group(1)), name))
+    return result
+
+
+def _dump_vtable_layouts(structs, header_path, parse_args, clang_binary,
+                        root_ns, verbose=False):
+    """Generic clang ``-fdump-vtable-layouts`` enrichment pass.
+
+    For every polymorphic class in ``structs`` (root namespace only), pick any
+    virtual method from AST data and emit ``auto u<N> = &Class::Method;`` in a
+    synthetic source.  A two-stage compile (``-fsyntax-only`` filter, then
+    ``-S -emit-llvm`` with ``-fdump-vtable-layouts``) yields exact slot
+    indices for the classes whose method addresses survive front-end checking.
+
+    The address-of-virtual-member trick avoids destructor instantiation, which
+    is what makes simpler approaches (``delete t``, ``t->~T()``) fail on
+    classes with smart-pointer members of forward-declared types.
+
+    Returns dict ``full_name -> [(slot_index, method_name)]``.  Empty when no
+    candidates could be found or when clang produced no output.
+    """
+    import tempfile
+
+    template_defs = set()
+    for k in structs:
+        if '<' in k:
+            template_defs.add(k.split('<', 1)[0])
+
+    ns_pre = root_ns + '::'
+    candidates = []  # (cls_full, method_name)
+    for k, s in structs.items():
+        if not s.get('has_vtable'):
+            continue
+        if '<' in k:
+            continue
+        if not k.startswith(ns_pre):
+            continue
+        if k in template_defs:
+            continue
+        m = _pick_virtual_method_for_addr(structs, k, root_ns)
+        if m:
+            candidates.append((k, m))
+
+    if not candidates:
+        return {}
+
+    header_fwd = header_path.replace('\\', '/')
+    tmp_dir = tempfile.mkdtemp(prefix='ghidra_vt_dump_')
+    spath_dry   = os.path.join(tmp_dir, 'force_vt_dry.cpp')
+    spath_clean = os.path.join(tmp_dir, 'force_vt_clean.cpp')
+
+    def _emit(items):
+        lines = ['#include "{}"'.format(header_fwd),
+                 'namespace __force_vt_dump {']
+        for i, (cls, m) in enumerate(items):
+            lines.append('    auto u{} = &{}::{};'.format(i, cls, m))
+        lines.append('}')
+        return '\n'.join(lines) + '\n'
+
+    try:
+        # Stage 1: dry-run with -fsyntax-only to identify bad declarations
+        with open(spath_dry, 'w', encoding='utf-8') as f:
+            f.write(_emit(candidates))
+        cmd_dry = [clang_binary, '--target=x86_64-pc-windows-msvc',
+                   '-fsyntax-only', '-ferror-limit=0'] + parse_args + [spath_dry]
+        if verbose:
+            print('Pass 4: dry-run vtable dump candidates ({} classes)...'.format(len(candidates)))
+        r_dry = subprocess.run(cmd_dry, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')
+        bad_lines = set()
+        err_re = re.compile(re.escape(spath_dry) + r':(\d+):\d+:\s+error:')
+        for ln in r_dry.stderr.splitlines():
+            m = err_re.search(ln)
+            if m:
+                bad_lines.add(int(m.group(1)))
+        # Header is 2 lines, decl idx 0 -> source line 3.
+        cleaned = [(c, m) for i, (c, m) in enumerate(candidates) if (i + 3) not in bad_lines]
+        if verbose:
+            print('  filtered {} bad address-takes; {} candidates remain'.format(
+                len(candidates) - len(cleaned), len(cleaned)))
+        if not cleaned:
+            return {}
+
+        # Stage 2: emit-llvm with vtable layout dump
+        with open(spath_clean, 'w', encoding='utf-8') as f:
+            f.write(_emit(cleaned))
+        cmd = [clang_binary, '--target=x86_64-pc-windows-msvc',
+               '-S', '-emit-llvm', '-o', os.devnull,
+               '-Xclang', '-fdump-vtable-layouts',
+               '-ferror-limit=0'] + parse_args + [spath_clean]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding='utf-8', errors='replace')
+        if r.returncode != 0 and not r.stdout:
+            if verbose:
+                print('  clang vtable codegen failed; skipping enrichment')
+            return {}
+    finally:
+        for p in (spath_dry, spath_clean):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+    layouts = _parse_vtable_dump(r.stdout, root_ns)
+    if verbose:
+        print('  parsed clang vtable indices for {} classes'.format(len(layouts)))
+    return layouts
+
+
+def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
+    """Replace AST-computed ``vfuncs`` with clang-dump slot data when available.
+
+    For each class with a clang-dump entry, ``vfuncs`` is rewritten to the
+    list of own-method slots (filtering out destructor and inherited entries
+    by intersecting with the class's own ``vmethods`` set), with byte offsets
+    computed as ``slot_index * 8``.
+
+    Classes without a clang-dump entry are left alone — the AST-based
+    ``_compute_vfuncs`` result remains in place.
+    """
+    if not vtable_layouts:
+        return 0
+    replaced = 0
+    for cls, slots in vtable_layouts.items():
+        st = structs.get(cls)
+        if not st:
+            continue
+        own_vms = set(st.get('vmethods', {}))
+        if not own_vms:
+            continue
+        clang_own = []
+        for slot_idx, mname in slots:
+            if mname in own_vms:
+                clang_own.append((mname, slot_idx * 8))
+        if not clang_own:
+            continue
+        st['vfuncs'] = clang_own
+        replaced += 1
+    if verbose and replaced:
+        print('Replaced vfuncs with clang vtable dump for {} classes'.format(replaced))
+    return replaced
+
+
+def _force_template_layouts(structs, header_path, parse_args, clang_binary,
+                            root_ns, verbose):
+    """Force clang to emit record layouts for empty template placeholders.
+
+    For each placeholder ``T<...>`` whose layout is unknown, emit a synthetic
+    .cpp file that includes the orchestrator header and contains
+    ``struct sN { T<...> _; };`` for every candidate.  Running clang's
+    record-layout dump on that file forces template instantiation and emits
+    the missing layouts, which we then merge back into the placeholder
+    structs.
+    """
+    import tempfile
+
+    empty = [k for k, s in structs.items()
+             if '<' in k and s['size'] == 0 and not s['fields']]
+    candidates = [n for n in empty if _is_safe_template_name(n)]
+    if not candidates:
+        return 0
+
+    header_fwd = header_path.replace('\\', '/')
+    lines = ['#include "{}"'.format(header_fwd),
+             'namespace __force_template_layouts {']
+    for i, name in enumerate(sorted(candidates)):
+        lines.append('  struct s{} {{ {} _; }};'.format(i, name))
+    lines.append('}')
+    src = '\n'.join(lines) + '\n'
+
+    tmp_dir = tempfile.mkdtemp(prefix='ghidra_force_tmpl_')
+    tmp_path = os.path.join(tmp_dir, 'force_template_layouts.cpp')
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(src)
+
+        if verbose:
+            print('Pass 3: forcing layouts for {} template placeholders...'.format(len(candidates)))
+        cmd = [clang_binary] + parse_args + [
+            '-fsyntax-only', '-ferror-limit=0',
+            '-Xclang', '-fdump-record-layouts-complete',
+            '-Xclang', '-fdump-record-layouts-canonical',
+            tmp_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace')
+        layouts = _parse_layouts_with_bases(result.stdout, root_ns=root_ns)
+        if verbose:
+            print('  Forced layout dump: {} new layouts'.format(len(layouts)))
+    finally:
+        try:
+            os.unlink(tmp_path)
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+    ns_pre = root_ns + '::'
+    filled = 0
+    for key in empty:
+        ldata = (layouts.get(key)
+                 or layouts.get(ns_pre + key)
+                 or (layouts.get(key[len(ns_pre):]) if key.startswith(ns_pre) else None))
+        if not ldata or ldata['size'] == 0:
+            continue
+        st = structs[key]
+        st['size']       = ldata['size']
+        st['fields']     = ldata['fields']
+        st['bases']      = [bname for bname, _ in ldata['bases']]
+        st['pdb_bases']  = ldata['bases']
+        st['has_vtable'] = ldata['has_vtable']
+        filled += 1
+    return filled
+
+
 def _propagate_template_layouts(structs):
     """Fill empty template placeholders from known instantiations of the same template.
 
@@ -1069,11 +1528,12 @@ def collect_types(header_path, include_path, parse_args,
     if verbose:
         print('  AST dump: {} lines'.format(ast_text.count('\n')))
 
-    enums, ast_classes = _parse_ast_dump(ast_text, include_path,
-                                         root_ns=root_namespace,
-                                         category_prefix=category_prefix)
+    enums, ast_classes, ast_aliases = _parse_ast_dump(ast_text, include_path,
+                                                      root_ns=root_namespace,
+                                                      category_prefix=category_prefix)
     if verbose:
-        print('  Parsed {} enums, {} classes from AST'.format(len(enums), len(ast_classes)))
+        print('  Parsed {} enums, {} classes, {} type aliases from AST'.format(
+            len(enums), len(ast_classes), len(ast_aliases)))
 
     # --- Pass 2: Record layouts for field offsets and sizes ---
     if verbose:
@@ -1105,6 +1565,21 @@ def collect_types(header_path, include_path, parse_args,
 
     _compute_vfuncs(structs, root_ns=root_namespace)
 
+    # --- Apply AST type aliases (using X = Y;) ---
+    if ast_aliases:
+        _apply_aliases_to_structs(structs, ast_aliases, verbose=verbose)
+
+    # --- Enrich vfuncs with clang -fdump-vtable-layouts (when available) ---
+    try:
+        _vt_layouts = _dump_vtable_layouts(
+            structs, header_path, parse_args, clang_binary,
+            root_ns=root_namespace, verbose=verbose)
+        if _vt_layouts:
+            _apply_vtable_dump(structs, _vt_layouts, root_ns=root_namespace, verbose=verbose)
+    except Exception as _e:
+        if verbose:
+            print('  vtable dump pass skipped: {}'.format(_e))
+
     # --- Template instantiation types ---
     tmpl_category = category_prefix + '/' + root_namespace
     template_source = ''
@@ -1129,6 +1604,12 @@ def collect_types(header_path, include_path, parse_args,
         _propagated = _propagate_template_layouts(structs)
         if _propagated:
             print('Propagated layout to {} empty template instantiations'.format(_propagated))
+
+        _forced = _force_template_layouts(
+            structs, header_path, parse_args, clang_binary,
+            root_ns=root_namespace, verbose=verbose)
+        if _forced:
+            print('Forced layout for {} template instantiations via synthesis pass'.format(_forced))
     except ImportError:
         pass
 

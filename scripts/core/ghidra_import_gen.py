@@ -351,7 +351,8 @@ def _resolve_struct_name(name):
         alias = TEMPLATE_TYPE_MAP.get(name)
         if alias:
             return created.get(alias)
-        return None
+        # Some template instantiations are emitted directly under their full name
+        return created.get(name)
     return created.get(name) or created.get(name.split('::')[-1])
 
 def resolve_type(type_str):
