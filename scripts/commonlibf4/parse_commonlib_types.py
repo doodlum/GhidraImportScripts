@@ -69,6 +69,7 @@ def main():
         build_vtable_structs as _build_vtable_structs,
         inject_vtable_fields as _inject_vtable_fields,
         flatten_structs       as _flatten_structs,
+        apply_secondary_vtable_typing as _apply_secondary_vtable_typing,
         generate_script,
     )
 
@@ -137,6 +138,7 @@ def main():
     vtable_structs = _build_vtable_structs(structs)
     _inject_vtable_fields(structs, vtable_structs)
     _flatten_structs(structs)
+    _apply_secondary_vtable_typing(structs)
 
     # --- Fallout4.pdb fallback symbols (rebased NG -> AE) ---
     print('\n=== Loading Fallout4.pdb fallback symbols (1.10.984 NG -> 1.11.191 AE) ===')

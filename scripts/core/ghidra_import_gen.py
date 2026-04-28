@@ -152,6 +152,7 @@ def build_vtable_structs(structs: dict) -> dict:
         return sigs
 
     vtable_structs = {}
+    secondary_count = 0
     for st in structs.values():
         if not st.get('has_vtable') and not st.get('vfuncs'):
             continue
@@ -179,8 +180,77 @@ def build_vtable_structs(structs: dict) -> dict:
             'size': vtbl_size,
         }
 
-    print('Built {} vtable structs'.format(len(vtable_structs)))
+        # --- Secondary vtables from clang -fdump-vtable-layouts (multi-inheritance) ---
+        secondaries = st.get('secondary_vtables') or {}
+        if secondaries:
+            sec_names = {}  # offset -> generated struct name
+            for offset, slot_list in secondaries.items():
+                if not slot_list:
+                    continue
+                sec_named = {sidx * 8: mname for sidx, mname in slot_list}
+                sec_max = max(sec_named.keys())
+                sec_size = sec_max + 8
+                sec_all = dict(sec_named)
+                if sec_size <= 0x4000:
+                    for off in range(0, sec_size, 8):
+                        if off not in sec_all:
+                            sec_all[off] = 'fn_{:03X}'.format(off)
+                sec_sorted = []
+                for off, sname in sorted(sec_all.items()):
+                    sig = sigs.get(sname)
+                    sec_sorted.append((off, sname,
+                                       sig[0] if sig else None,
+                                       sig[1] if sig else None))
+                sec_struct_name = '{}_vtbl_{}'.format(st['name'], offset)
+                key = '{}|secondary|{}'.format(st['full_name'], offset)
+                vtable_structs[key] = {
+                    'name': sec_struct_name,
+                    'class_full_name': st['full_name'],
+                    'category': st['category'],
+                    'slots': sec_sorted,
+                    'size': sec_size,
+                }
+                sec_names[offset] = sec_struct_name
+                secondary_count += 1
+            if sec_names:
+                st['secondary_struct_names'] = sec_names
+
+    if secondary_count:
+        print('Built {} vtable structs ({} secondary)'.format(
+            len(vtable_structs), secondary_count))
+    else:
+        print('Built {} vtable structs'.format(len(vtable_structs)))
     return vtable_structs
+
+
+def apply_secondary_vtable_typing(structs: dict) -> int:
+    """Rewrite each class's flattened ``__vftable_<base>`` field types so they
+    point at the per-class secondary vtable struct generated for that subobject
+    offset, instead of inheriting the base class's primary vtable struct type.
+
+    Must be called AFTER ``flatten_structs`` so the secondary ``__vftable_<base>``
+    fields exist at their absolute offsets.  Each struct must already have
+    ``secondary_struct_names = {offset: struct_name}`` populated (done by
+    ``build_vtable_structs`` from clang ``-fdump-vtable-layouts`` data).
+    """
+    rewrites = 0
+    for st in structs.values():
+        sec_map = st.get('secondary_struct_names') or {}
+        if not sec_map:
+            continue
+        for f in st.get('fields', []):
+            if not f.get('name', '').startswith('__vftable'):
+                continue
+            offset = f.get('offset', 0)
+            if offset == 0:
+                continue
+            sec_name = sec_map.get(offset)
+            if sec_name:
+                f['type'] = 'vtblptr:' + sec_name
+                rewrites += 1
+    if rewrites:
+        print('Retyped {} secondary vtable pointer fields'.format(rewrites))
+    return rewrites
 
 
 def inject_vtable_fields(structs: dict, vtable_structs: dict) -> None:

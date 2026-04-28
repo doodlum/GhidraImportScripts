@@ -28,6 +28,7 @@ from ghidra_import_gen import (
     build_vtable_structs as _build_vtable_structs,
     inject_vtable_fields as _inject_vtable_fields,
     flatten_structs as _flatten_structs,
+    apply_secondary_vtable_typing as _apply_secondary_vtable_typing,
     generate_script,
 )
 
@@ -153,6 +154,7 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
     vtable_structs = _build_vtable_structs(structs)
     _inject_vtable_fields(structs, vtable_structs)
     _flatten_structs(structs)
+    _apply_secondary_vtable_typing(structs)
 
     print('Generating Ghidra script...')
     n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json, template_source)

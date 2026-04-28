@@ -1181,40 +1181,117 @@ def _extract_vtable_method_name(sig: str):
 def _parse_vtable_dump(text, root_ns):
     """Parse clang ``-fdump-vtable-layouts`` text into per-class slot maps.
 
-    Returns dict ``full_name -> [(slot_index, method_name)]`` listing the
-    class's own (own + inherited) primary-vtable indices in order.
+    Returns ``(primary_layouts, secondary_layouts)``:
+
+      primary_layouts:   ``{full_name: [(func_slot, method_name), ...]}``
+                         from ``VFTable indices for 'X'`` blocks (slot indices
+                         match the function-slot scheme: 0 = dtor).
+
+      secondary_layouts: ``{(full_name, subobject_offset): [(func_slot, method_name), ...]}``
+                         derived from ``VFTable for 'B' in 'C'`` blocks whose
+                         ``[this adjustment: -N non-virtual]`` annotations show
+                         the B subobject lives at offset ``N`` in C. Slot
+                         indices already in function-slot space (RTTI dropped).
     """
-    result = {}
-    cur = None
+    primary = {}
+    secondary = {}
+
+    for_re     = re.compile(r"^VFTable for '([^']+)'((?:\s+in\s+'[^']+')*)\s*\(")
+    in_re      = re.compile(r"\s+in\s+'([^']+)'")
     indices_re = re.compile(r"^VFTable indices for '([^']+)'")
-    full_re    = re.compile(r"^VFTable for ")
     slot_re    = re.compile(r"^\s*(\d+)\s*\|\s*(.+?)\s*$")
+    adj_re     = re.compile(r'\[this adjustment:\s*(-?\d+)\s+non-virtual\]')
+
+    state           = None     # 'indices' | 'full_block' | None
+    cur_class       = None
+    cur_full_class  = None
+    cur_subobj_off  = 0
+    cur_slots       = []
+
+    def flush_secondary():
+        nonlocal cur_full_class, cur_subobj_off, cur_slots
+        if cur_full_class and cur_subobj_off > 0 and cur_slots:
+            key = (cur_full_class, cur_subobj_off)
+            # Multiple 'in' chains can produce blocks for the same (C, offset);
+            # keep the longest (most informative) one.
+            if key not in secondary or len(cur_slots) > len(secondary[key]):
+                secondary[key] = list(cur_slots)
+        cur_full_class = None
+        cur_subobj_off = 0
+        cur_slots = []
+
+    def reset():
+        nonlocal state, cur_class
+        if state == 'full_block':
+            flush_secondary()
+        state = None
+        cur_class = None
+
     for ln in text.splitlines():
         if not ln.strip():
-            cur = None
+            reset()
             continue
-        m = indices_re.match(ln)
-        if m:
-            cur = m.group(1)
-            result.setdefault(cur, [])
+
+        m_idx = indices_re.match(ln)
+        if m_idx:
+            reset()
+            cur_class = m_idx.group(1)
+            primary.setdefault(cur_class, [])
+            state = 'indices'
             continue
-        if full_re.match(ln):
-            cur = None
+
+        m_for = for_re.match(ln)
+        if m_for:
+            reset()
+            ins = in_re.findall(m_for.group(2))
+            if ins:
+                cur_full_class = ins[-1]
+                cur_subobj_off = 0
+                cur_slots = []
+                state = 'full_block'
+            else:
+                state = None
             continue
-        if cur is None:
+
+        if state == 'indices':
+            if ln.lstrip().startswith(('--', '[')):
+                continue
+            m_slot = slot_re.match(ln)
+            if not m_slot:
+                continue
+            sig = m_slot.group(2)
+            if sig.startswith('[') or 'this adjustment' in sig:
+                continue
+            name = _extract_vtable_method_name(sig)
+            if name and cur_class:
+                primary[cur_class].append((int(m_slot.group(1)), name))
             continue
-        if ln.lstrip().startswith('--') or ln.lstrip().startswith('['):
+
+        if state == 'full_block':
+            m_adj = adj_re.search(ln)
+            if m_adj:
+                adj = int(m_adj.group(1))
+                if adj < 0:
+                    cur_subobj_off = max(cur_subobj_off, -adj)
+                continue
+            m_slot = slot_re.match(ln)
+            if m_slot:
+                idx = int(m_slot.group(1))
+                if idx == 0:
+                    # RTTI marker line; skip
+                    continue
+                sig = m_slot.group(2)
+                if sig.endswith('RTTI'):
+                    continue
+                name = _extract_vtable_method_name(sig)
+                if name:
+                    cur_slots.append((idx - 1, name))  # function-slot index
             continue
-        m_slot = slot_re.match(ln)
-        if not m_slot:
-            continue
-        sig = m_slot.group(2)
-        if sig.startswith('[') or 'this adjustment' in sig:
-            continue
-        name = _extract_vtable_method_name(sig)
-        if name:
-            result[cur].append((int(m_slot.group(1)), name))
-    return result
+
+    if state == 'full_block':
+        flush_secondary()
+
+    return primary, secondary
 
 
 def _dump_vtable_layouts(structs, header_path, parse_args, clang_binary,
@@ -1320,10 +1397,11 @@ def _dump_vtable_layouts(structs, header_path, parse_args, clang_binary,
         except OSError:
             pass
 
-    layouts = _parse_vtable_dump(r.stdout, root_ns)
+    primary_layouts, secondary_layouts = _parse_vtable_dump(r.stdout, root_ns)
     if verbose:
-        print('  parsed clang vtable indices for {} classes'.format(len(layouts)))
-    return layouts
+        print('  parsed clang vtable indices for {} classes ({} secondary blocks)'.format(
+            len(primary_layouts), len(secondary_layouts)))
+    return primary_layouts, secondary_layouts
 
 
 def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
@@ -1358,6 +1436,30 @@ def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
     if verbose and replaced:
         print('Replaced vfuncs with clang vtable dump for {} classes'.format(replaced))
     return replaced
+
+
+def _store_vtable_secondaries(structs, secondary_layouts, verbose=False):
+    """Attach per-class secondary-vtable layout maps to the struct dicts.
+
+    Each entry is recorded on the most-derived class as
+    ``st['secondary_vtables'][offset] = [(slot, method_name), ...]``.
+    Used downstream by vtable-struct generation and field-type rewriting.
+    """
+    if not secondary_layouts:
+        return 0
+    stored = 0
+    for (cls, off), slots in secondary_layouts.items():
+        st = structs.get(cls)
+        if not st or not slots:
+            continue
+        sv = st.setdefault('secondary_vtables', {})
+        # Keep the longer one if a duplicate (C, off) appears
+        if off not in sv or len(slots) > len(sv[off]):
+            sv[off] = list(slots)
+            stored += 1
+    if verbose and stored:
+        print('Stored {} secondary-vtable layouts on classes'.format(stored))
+    return stored
 
 
 def _force_template_layouts(structs, header_path, parse_args, clang_binary,
@@ -1571,11 +1673,13 @@ def collect_types(header_path, include_path, parse_args,
 
     # --- Enrich vfuncs with clang -fdump-vtable-layouts (when available) ---
     try:
-        _vt_layouts = _dump_vtable_layouts(
+        _vt_primary, _vt_secondary = _dump_vtable_layouts(
             structs, header_path, parse_args, clang_binary,
             root_ns=root_namespace, verbose=verbose)
-        if _vt_layouts:
-            _apply_vtable_dump(structs, _vt_layouts, root_ns=root_namespace, verbose=verbose)
+        if _vt_primary:
+            _apply_vtable_dump(structs, _vt_primary, root_ns=root_namespace, verbose=verbose)
+        if _vt_secondary:
+            _store_vtable_secondaries(structs, _vt_secondary, verbose=verbose)
     except Exception as _e:
         if verbose:
             print('  vtable dump pass skipped: {}'.format(_e))
