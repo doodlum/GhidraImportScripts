@@ -199,22 +199,27 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
   offset in C's flattened layout to point at C's secondary struct instead of
   B's primary, so multi-inheritance vfptr fields type-correctly per
   most-derived class.
-- **Type resolution in signatures.** Most `void *` fallbacks have been removed
-  by:
-  - extracting `using X = Y;` aliases from the AST and rewriting descriptors
-    to canonical form (with each struct's `full_name` as `class_scope` so
-    class-local typedefs like `Foo::EventSource_t` resolve too);
-  - stripping `const`/`volatile`/`restrict` (including the `T *const` case);
-  - mapping `_Bool`, `std::byte`, `wchar_t`, `char16_t`, `char32_t`,
-    `char8_t`, `__int128` directly to primitives in `_CLANG_TYPE_MAP`;
-  - generating 0-byte opaque struct entries for any name still referenced as
-    `struct:NAME` but not present in `structs`/`enums` (Havok `hk*`,
-    `REX::W32::*`, nested types inside templates) — pointers to them
-    become typed in Ghidra instead of `void *`.
+- **Type resolution in signatures.** Almost all `void *` fallbacks have been
+  removed via:
+  - `using X = Y;` alias extraction from the AST and descriptor rewriting
+    (with each struct's `full_name` as `class_scope` so class-local typedefs
+    like `Foo::EventSource_t` resolve);
+  - `const`/`volatile`/`restrict` stripping (including `T *const`);
+  - primitive map entries for `_Bool`, `std::byte`, `wchar_t`, `char16_t`,
+    `char32_t`, `char8_t`, `__int128`, `long double`;
+  - SIMD vector detection: clang's `__attribute__((__vector_size__(N *
+    sizeof(T))))` is mapped to `arr:u8:<bytes>`;
+  - function-pointer-shape detection (`Ret (*)(args)`, `Ret (Class::*)(args)`,
+    `Ret (**)(args)`, `Ret (&)(args)`) collapsed to plain `ptr`;
+  - 0-byte opaque struct entries for any name referenced as `struct:NAME`
+    but not present in `structs`/`enums`, including nested types inside
+    template instantiations (`Outer<args>::Inner`) — pointers to them get
+    typed in Ghidra instead of `void *`.
 
-  F4 result: unresolved field types dropped from 13.7% → 3.6%. Remaining
-  cases are template parameter packs (`Args...`), unspecialised template
-  parameters (`T`), and clang-attribute-syntax SIMD types (rare).
+  F4 result: unresolved field types dropped from **13.7% → 0.4%**; structured
+  symbol-signature resolution rose to **93.1%**. Remaining ~0.4% is template
+  parameter packs (`Args...`), unspecialised template parameters (single-letter
+  `T`), and clang lambda-typed expressions.
 - **Fallout 4 PDB coverage.** The shipped `Fallout4.pdb` only contains ~11.7k
   real public symbols (the rest are auto-named `FUN_*` placeholders, filtered
   out). The vast majority of named F4 functions therefore come from the

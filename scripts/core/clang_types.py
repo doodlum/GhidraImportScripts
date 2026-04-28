@@ -66,7 +66,7 @@ _CLANG_TYPE_MAP = {
     'long': 'i32', 'signed long': 'i32', 'unsigned long': 'u32',
     'long long': 'i64', 'signed long long': 'i64', 'unsigned long long': 'u64',
     '__int64': 'i64', 'unsigned __int64': 'u64',
-    'float': 'f32', 'double': 'f64',
+    'float': 'f32', 'double': 'f64', 'long double': 'f64',
     'void': 'void',
     # C/C++ wide & UTF char types (Windows: wchar_t = 16-bit)
     'wchar_t':  'u16',
@@ -214,12 +214,58 @@ def _qualify_type(name, root_ns='RE'):
     return '{}{}{}{}'.format(leading, root_ns + '::', name, trailing)
 
 
+_VEC_ATTR_RE = re.compile(
+    r'__attribute__\s*\(\s*\(\s*__vector_size__\s*\(\s*'
+    r'(\d+)\s*\*\s*sizeof\s*\(\s*([^)]+?)\s*\)\s*\)\s*\)\s*\)\s*'
+)
+_PRIM_BYTE_SIZE = {
+    'char': 1, 'signed char': 1, 'unsigned char': 1, 'bool': 1, '_Bool': 1, 'byte': 1,
+    'char8_t': 1, 'std::byte': 1,
+    'short': 2, 'signed short': 2, 'unsigned short': 2, 'wchar_t': 2,
+    'char16_t': 2,
+    'int': 4, 'signed int': 4, 'unsigned int': 4, 'char32_t': 4,
+    'long': 4, 'signed long': 4, 'unsigned long': 4,
+    'float': 4,
+    'long long': 8, 'signed long long': 8, 'unsigned long long': 8,
+    '__int64': 8, 'unsigned __int64': 8,
+    'double': 8, 'long double': 8,
+}
+
+
+def _is_function_pointer_type(raw: str) -> bool:
+    """Detect function-pointer-shaped types in any depth:
+    ``Ret (*)(args)``, ``Ret (**)(args)``, ``Ret (Class::*)(args)``,
+    ``Ret (*[N])(args)`` and ``Ret (&)(args)`` (function reference).
+    """
+    return bool(re.search(
+        r'\(\s*(?:[\w:]+\s*::\s*)?[*&]+\s*(?:\[\d*\]\s*)?[\w]*\s*\)\s*\(', raw))
+
+
 def _record_type_to_pipeline(raw, root_ns='RE'):
     """Convert a raw clang type string to a pipeline type descriptor."""
     raw = _KW_STRIP_RE.sub('', raw.strip()).strip()
     # Drop cv-qualifiers — they don't affect the underlying type or layout.
     raw = _CV_STRIP_RE.sub(' ', raw).strip()
     raw = re.sub(r'\s+', ' ', raw)
+
+    # SIMD vectors: clang emits `__attribute__((__vector_size__(N * sizeof(T)))) T`
+    # Map to a byte array of the computed size.
+    m_vec = _VEC_ATTR_RE.search(raw)
+    if m_vec:
+        try:
+            count = int(m_vec.group(1))
+            elem  = m_vec.group(2).strip()
+            elem_size = _PRIM_BYTE_SIZE.get(elem)
+            if elem_size:
+                return 'arr:u8:{}'.format(count * elem_size)
+        except ValueError:
+            pass
+        return 'ptr'
+
+    # Function pointer types: `Ret (*)(args)` and member pointers `Ret (C::*)(args)`
+    if _is_function_pointer_type(raw):
+        return 'ptr'
+
     if raw.endswith('*') or raw.endswith('&'):
         pointee = raw[:-1].strip()
         inner = _record_type_to_pipeline(pointee, root_ns)
@@ -1449,24 +1495,45 @@ def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
     return replaced
 
 
-_OPAQUE_NAME_RE   = re.compile(r'^[A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*$')
 _OPAQUE_BAD_FRAGS = ('__attribute__', '*const', '*volatile', 'unnamed', 'lambda',
-                     'anonymous', '$')
+                     'anonymous', '$', '...', '(*)', '(&)', ' (*', ' (&')
+
+_OPAQUE_PLAIN_NAME_RE  = re.compile(r'^[A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*$')
+# Nested type inside a template instantiation:  Outer<args>::Inner[::Inner2...]
+# Tail must be plain identifiers; head may contain matched <>.
+_OPAQUE_NESTED_RE      = re.compile(
+    r'^[\w:]+(?:<.+>)(?:::[A-Za-z_][\w]*)+$'
+)
 
 
 def _is_opaque_safe_name(name: str) -> bool:
-    """Reject names that aren't safe to materialise as opaque structs."""
+    """Reject names that aren't safe to materialise as opaque structs.
+
+    Allowed:
+      - Plain qualified names (no template args):  ``RE::Foo::Bar``
+      - Nested types in template instantiations:   ``Foo<X>::Inner``
+        (the trailing component after the closing ``>`` must be a plain
+         identifier path).
+    """
     if not name:
         return False
     if any(s in name for s in _OPAQUE_BAD_FRAGS):
         return False
-    # Single-letter uppercase typically denotes uninstantiated template params (T, K, V).
     last = name.split('::')[-1]
+    # Single-letter uppercase typically denotes uninstantiated template params.
     if len(last) == 1 and last.isupper():
         return False
-    if not _OPAQUE_NAME_RE.match(name):
+    # Reject names whose trailing component still contains template angle brackets
+    # — those are pure templates handled by template_map, not nested members.
+    if '<' in last or '>' in last:
         return False
-    return True
+    # Plain qualified path (no template anywhere)
+    if _OPAQUE_PLAIN_NAME_RE.match(name):
+        return True
+    # Nested type inside a template instantiation
+    if _OPAQUE_NESTED_RE.match(name):
+        return True
+    return False
 
 
 def _collect_descriptor_refs(structs):
@@ -1516,15 +1583,14 @@ def _add_opaque_for_forward_decls(structs, enums, root_ns, category_prefix, verb
     existing_short_enum   = {e.split('::')[-1] for e in enums}
     added = 0
     for name in sorted(referenced):
-        # Skip templates — those are handled by the template_map machinery.
-        if '<' in name:
-            continue
         if name in structs or name in enums:
             continue
         short = name.split('::')[-1]
-        if short in existing_short_struct or short in existing_short_enum:
-            continue
+        # Whole-template names go through template_map; nested types inside
+        # templates (Outer<args>::Inner) are admitted.
         if not _is_opaque_safe_name(name):
+            continue
+        if short in existing_short_struct or short in existing_short_enum:
             continue
         ns_parts = name.split('::')[:-1]
         if ns_parts:
