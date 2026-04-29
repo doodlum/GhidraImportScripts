@@ -143,9 +143,13 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
         print('ERROR: Could not find Skyrim.h at', SKYRIM_H)
         sys.exit(1)
 
+    # Capture types from sibling namespaces (REL, REX, SKSE) under the
+    # CommonLibSSE include root — without this the AST extraction would skip
+    # methods declared outside the RE/ subdirectory.
     enums, structs, template_source = collect_types(
         SKYRIM_H, RE_INCLUDE, parse_args,
         verbose=True,
+        extra_scope_paths=[COMMONLIB_INCLUDE],
     )
     print('Found {} enums, {} structs/classes'.format(len(enums), len(structs)))
 

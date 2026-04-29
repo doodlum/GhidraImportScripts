@@ -128,9 +128,17 @@ def main():
     if os.path.isdir(shared_include):
         parse_args = ['-I' + shared_include] + parse_args
 
+    # Capture types from REL/, REX/, F4SE/ as well as RE/ — they're sibling
+    # namespaces under CommonLibF4 whose AST methods would otherwise be skipped.
+    extra_scopes = [
+        COMMONLIB_INCLUDE,                                   # F4SE/ + RE/
+        os.path.join(PROJECT_DIR, 'extern', 'CommonLibF4',
+                     'lib', 'commonlib-shared', 'include'),  # REL/ + REX/
+    ]
     enums, structs, template_source = collect_types(
         FALLOUT_H, RE_INCLUDE, parse_args,
-        verbose=True, category_prefix='/CommonLibF4')
+        verbose=True, category_prefix='/CommonLibF4',
+        extra_scope_paths=extra_scopes)
     print(f'Found {len(enums)} enums, {len(structs)} structs/classes')
 
     _enrich_symbols(symbols, structs)

@@ -211,7 +211,10 @@ def _qualify_type(name, root_ns='RE'):
         return '{}{}{}'.format(leading, '::'.join(qualified_parts), trailing)
     if name in _PRIM_BARE:
         return '{}{}{}'.format(leading, name, trailing)
-    return '{}{}{}{}'.format(leading, root_ns + '::', name, trailing)
+    # Bare leaf — protect non-type tokens (numeric template args like ``16``,
+    # boolean/null literals, string/char literals) before falling back to the
+    # ``root_ns::name`` qualifier.
+    return '{}{}{}'.format(leading, _ensure_qualified(name, root_ns), trailing)
 
 
 _VEC_ATTR_RE = re.compile(
@@ -393,11 +396,14 @@ def _parse_line(line):
     return 0, None
 
 
-def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/CommonLibSSE'):
+def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/CommonLibSSE',
+                    extra_scope_paths=None):
     """Parse clang -ast-dump text output for enums and virtual methods.
 
     Streams through the text tracking namespace/class nesting via indentation.
-    Only records types defined under the given include path.
+    Records types defined under the given include path or any
+    ``extra_scope_paths`` — used to capture sibling namespaces (REL, REX, F4SE,
+    Scaleform stubs) shipped alongside the main RE include directory.
 
     Returns:
         enums: dict full_name -> {name, full_name, size, category, values}
@@ -407,7 +413,11 @@ def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/Commo
     ast_classes = {}
     aliases = {}  # alias_full_name -> canonical_full_name (for `using X = Y;`)
 
-    re_path_fwd = re_include_path.replace('\\', '/')
+    scope_paths = [re_include_path.replace('\\', '/')]
+    for p in (extra_scope_paths or ()):
+        if p:
+            scope_paths.append(p.replace('\\', '/'))
+    re_path_fwd = scope_paths[0]
 
     # Nesting stack: [(depth, kind, name, in_re)]
     stack = []
@@ -436,9 +446,10 @@ def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/Commo
 
     def _src_is_re(content):
         m = re.search(r'<([^>]+)>', content)
-        if m:
-            return re_path_fwd in m.group(1).replace('\\', '/')
-        return False
+        if not m:
+            return False
+        loc = m.group(1).replace('\\', '/')
+        return any(p in loc for p in scope_paths)
 
     for line in text.splitlines():
         depth, content = _parse_line(line)
@@ -458,12 +469,32 @@ def _parse_ast_dump(text, re_include_path, root_ns='RE', category_prefix='/Commo
                 cur_enum = None
                 cur_enum_depth = 0
 
-        # NamespaceDecl — name is the last word
+        # NamespaceDecl — name is the trailing identifier, but clang appends
+        # modifier keywords ``nested`` (for ``namespace A::B {}`` form) and
+        # ``inline`` after the name.  Strip those so we read the real name.
         if content.startswith('NamespaceDecl '):
-            ns_name = content.rstrip().rsplit(None, 1)[-1]
+            tokens = content.rstrip().split()
+            while tokens and tokens[-1] in ('nested', 'inline'):
+                tokens.pop()
+            if not tokens:
+                continue
+            ns_name = tokens[-1]
             if ns_name.startswith('0x') or ns_name in ('C', 'C++'):
                 continue
-            in_re = _is_re() or ns_name == 'RE'
+            # ``in_re`` propagates the in-scope flag down so child decls don't
+            # need their own file location.  A NamespaceDecl is in scope when:
+            #   1. an ancestor was already in scope, OR
+            #   2. it's the configured root namespace (``RE`` by default), OR
+            #   3. its declaration's file location is under one of the
+            #      configured scope paths (covers REL/REX/SKSE/F4SE).
+            #   4. it's ``std`` — std-derived user types (std::runtime_error
+            #      subclasses, std::function vtables, etc.) need their bases'
+            #      virtual-method signatures to generate accurate vtable
+            #      structs for the user-facing classes that inherit from them.
+            in_re = (_is_re()
+                     or ns_name == root_ns
+                     or ns_name == 'std'
+                     or _src_is_re(content))
             stack.append((depth, 'namespace', ns_name, in_re))
             continue
 
@@ -1927,7 +1958,8 @@ def _propagate_template_layouts(structs):
 
 def collect_types(header_path, include_path, parse_args,
                   verbose=False, clang_binary=None,
-                  root_namespace='RE', category_prefix='/CommonLibSSE'):
+                  root_namespace='RE', category_prefix='/CommonLibSSE',
+                  extra_scope_paths=None):
     """Parse C++ headers via clang.exe and collect type definitions.
 
     Two-pass approach:
@@ -1986,7 +2018,8 @@ def collect_types(header_path, include_path, parse_args,
 
     enums, ast_classes, ast_aliases = _parse_ast_dump(ast_text, include_path,
                                                       root_ns=root_namespace,
-                                                      category_prefix=category_prefix)
+                                                      category_prefix=category_prefix,
+                                                      extra_scope_paths=extra_scope_paths)
     if verbose:
         print('  Parsed {} enums, {} classes, {} type aliases from AST'.format(
             len(enums), len(ast_classes), len(ast_aliases)))

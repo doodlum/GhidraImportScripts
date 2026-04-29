@@ -219,11 +219,43 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
     template instantiations (`Outer<args>::Inner`) — pointers to them get
     typed in Ghidra instead of `void *`.
 
-  F4 result: unresolved field types dropped from **13.7% → 1.1%** (after the
-  pointer-chaining and template-method fixes); structured symbol-signature
-  resolution at **100%** for all primary symbols. Remaining ~1.1% is split
-  between member function-pointer typedefs (intentionally collapsed to plain
-  `ptr`) and template parameter packs / unspecialised parameters.
+  F4 result: unresolved field types dropped from **13.7% → 0.30%** (after
+  pointer-chaining, template-method propagation, sibling-namespace AST scope,
+  and `std::` AST inclusion); Skyrim AE/SE: **0.36%**. Structured
+  symbol-signature resolution at **100%** for all primary symbols. The
+  remaining 0.30–0.36% is mostly member function-pointer typedefs
+  (intentionally collapsed to plain `ptr`) and a handful of stdlib stream
+  internals (`basic_ostream`, `basic_ostringstream`) whose virtual-method
+  declarations live in MSVC headers outside the project's include scope.
+- **AST scope.** `_parse_ast_dump`'s in-scope test originally fired only on
+  the configured root namespace (`RE`) and on file paths under the main
+  include directory. Sibling top-level namespaces (`REL`, `REX`, `F4SE`,
+  `SKSE`, `Scaleform`) and `std` were silently skipped, so all the IUnknown /
+  D3D11 / Scaleform / std-stream classes inherited via CommonLib's interface
+  shims kept their `vmethods` empty — and their derived classes ended up
+  with bare `__vftable` pointers.  The fix:
+  1. `extra_scope_paths` parameter on `collect_types`, plumbed in by both
+     orchestrators, lets the parser accept any AST decl whose source location
+     is under a configured commonlib subdirectory (covers REL/REX/F4SE/SKSE).
+  2. NamespaceDecl now sets `in_re=True` on three additional triggers: the
+     namespace's own source location matches a scope path, the namespace
+     name equals the configured root, or the namespace is `std` (so user
+     classes deriving from `std::runtime_error`, `std::exception`,
+     `std::function` chains pick up the inherited virtual slots).
+  3. `nested` and `inline` modifier tokens that clang appends after the
+     namespace name in `namespace A::B {}` declarations are now stripped
+     before the trailing token is read as the namespace name — previously
+     classes inside such blocks were silently filed under a bogus
+     `RE::nested::...` namespace and lost all their AST methods.
+  4. Numeric / boolean / string literals appearing as template arguments
+     (`<16>`, `<false>`, `<"foo">`) are no longer wrongly rewritten to
+     `RE::16`, `RE::false`, etc. by the qualifier — `_qualify_type`'s leaf
+     branch defers to `_ensure_qualified` so non-type tokens pass through.
+
+  Combined effect: ~5,200 bad-named template instantiations vanished, vtable
+  struct count went from 1,075 → **1,292** (F4) and 1,825 → **2,024**
+  (Skyrim), template-method propagation jumped to **26,671** instantiations
+  (was 1,771).
 - **Template-instantiation methods.** Layout-only template instantiations
   (e.g. `RE::BSTEventSink<RE::FooEvent>`) used to inherit only the layout
   from the record-layout dump and lost the template definition's `vmethods`
