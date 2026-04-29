@@ -10,16 +10,22 @@ The generated script handles:
   - Signature application via structured pipeline types (FunctionDefinitionDataType)
     or C prototype parsing (CParserUtils) with type simplification fallback
   - Virtual function naming by walking VTABLE label addresses
-  - Fallback symbol application (PDB / AE rename) for unnamed functions
+  - Fallback symbol application (PDB / AE rename / IDA NAME script) for
+    unnamed functions
 
 This module is game/project-agnostic. All project-specific logic (source parsing,
-address libraries, PDB loading, relocation scanning) lives in the caller.
+address libraries, fallback-name loading, relocation scanning) lives in the
+caller.
 
 Public API:
-  build_vtable_structs()  - build vtable descriptors from virtual class hierarchy
-  inject_vtable_fields()  - prepend __vftable pointers to virtual structs
-  flatten_structs()       - expand base class fields into derived structs
-  generate_script()       - emit the Ghidra import script
+  build_vtable_structs()         - build primary + secondary vtable descriptors
+                                   from the virtual class hierarchy
+  inject_vtable_fields()         - prepend __vftable pointers to virtual structs
+  flatten_structs()              - expand base class fields into derived structs
+  apply_secondary_vtable_typing() - retype non-zero-offset __vftable_<base>
+                                    fields to per-class secondary vtable structs
+                                    (multi-inheritance)
+  generate_script()              - emit the Ghidra import script
 """
 
 from __future__ import annotations

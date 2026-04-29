@@ -7,6 +7,7 @@ Pipeline:
   Types:        core/clang_types.py  (clang AST dump + record layouts)
   Relocations:  reloc_parser.py      (IDs.h map + ID::Class::Method references)
   Address lib:  address_library.py   (1-11-191 AE)
+  Fallback:     ida_names.py         (extras/IDAImportNames_1.11.191.0.py)
   Script gen:   core/ghidra_import_gen.py
 
 Generates:

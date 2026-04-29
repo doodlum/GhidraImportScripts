@@ -2,17 +2,31 @@
 """
 Clang subprocess-based C++ type extraction for Ghidra import.
 
-Two-pass approach using clang.exe:
-  Pass 1: -ast-dump (text)                       → enums, base classes, virtual methods
-  Pass 2: -fdump-record-layouts-complete/canonical → struct fields, byte offsets, sizes
+Four-pass approach using clang.exe:
+  Pass 1: -ast-dump (text)
+            → enums, base classes, virtual methods, type aliases
+  Pass 2: -fdump-record-layouts-complete/canonical
+            → struct fields, byte offsets, sizes, base offsets
+  Pass 3: synthetic ``struct sN { T<args> _; }`` + record-layout dump
+            → forced layouts for template instantiations the orchestrator
+              header never used (and re-tried for entries propagation
+              filled with shape-mismatched donor fields)
+  Pass 4: synthetic ``auto u<N> = &Class::Method`` + ``-fdump-vtable-layouts``
+            → exact primary-vtable slot indices and per-(class, subobject)
+              secondary-vtable layouts for multi-inheritance
 
-After both passes, results are merged, template instantiations are discovered
-via template_types.py, and layouts are propagated to empty template entries.
+After all passes, results are merged, template instantiations are discovered
+via template_types.py, vmethods/methods are propagated from each template
+definition onto its instantiations, anonymous lambda/unnamed types are
+stripped, and forward-declared external types get 0-byte opaque stubs so
+references type-check in Ghidra.
 
-Project-agnostic: root namespace and category prefix are configurable.
+Project-agnostic: root namespace and category prefix are configurable, and
+``extra_scope_paths`` lets the AST extraction follow sibling header trees
+(REL/REX/F4SE/SKSE/Scaleform) outside the main include dir.
 
 Public API:
-  collect_types()         - run both passes and return (enums, structs, template_source)
+  collect_types()         - run all passes and return (enums, structs, template_source)
   find_clang_binary()     - locate clang.exe on Windows (registry, common paths, PATH)
   _setup_include_paths()  - build clang include args from CommonLib + stub dirs
 """

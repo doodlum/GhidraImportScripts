@@ -133,7 +133,7 @@ ghidra_import_gen.py          ─── emits the .py script ───┴─► 
 
 **Symbol sources** (priority order):
 
-1. `RELOCATION_ID(SE, AE)` (Skyrim) or `REL::ID Name{ng_id}` (F4 libxse) macros
+1. `RELOCATION_ID(SE, AE)` (Skyrim) or `REL::ID Name{id}` (F4 libxse) macros
 2. `Offsets_RTTI.h`, `Offsets_NiRTTI.h`, `Offsets_VTABLE.h` labels
 3. `RE::Offset::` namespace IDs (Skyrim)
 4. CommonLibSSE `src/*.cpp` cross-references (Skyrim only)
@@ -141,9 +141,10 @@ ghidra_import_gen.py          ─── emits the .py script ───┴─► 
 6. Fallback: PDB public symbols (`SkyrimSE.pdb`) — Skyrim
 7. Fallback: IDA `NAME(addr, …)` script (`IDAImportNames_1.11.191.0.py`) — F4 AE
 
-Vtable slots known from the AST upgrade matching fallback symbols' source
-from PDB/rename/IDA to the CommonLib name, so they appear under
-`/CommonLibSSE/` or `/CommonLibF4/` in the Data Type Manager.
+Fallback symbols whose address lands on a known CommonLib vtable slot are
+re-tagged with the slot's CommonLib name (and filed under `/CommonLibSSE/`
+or `/CommonLibF4/` in the Data Type Manager) instead of the original
+PDB/rename/IDA name.
 
 ---
 
@@ -151,13 +152,19 @@ from PDB/rename/IDA to the CommonLib name, so they appear under
 
 Each `CommonLibImport_*.py` is a self-contained Jython script that:
 
-- Creates all enums, structs, and vtable structs under `/CommonLib<Game>/`
-- Populates struct fields with computed offsets and types
+- Creates all enums, structs, primary + secondary vtable structs under
+  `/CommonLib<Game>/`
+- Populates struct fields with computed offsets and types (including
+  flattened base-class fields and per-class secondary `__vftable_<base>`
+  pointers for multi-inheritance)
 - Names virtual functions by walking vtable addresses in the binary
-- Applies function signatures via `CParserUtils.parseSignature()` (with a
-  `void *` fallback for unresolved type names)
+- Applies function signatures by building a `FunctionDefinitionDataType`
+  directly from the pipeline's structured type descriptors (falling back
+  to `CParserUtils.parseSignature()` with `void *` substitution for the
+  rare cases the structured path can't resolve)
 - Labels every known address-library symbol
-- Adds a `Source: <origin>` plate comment to each named function
+- Adds a `Source: <origin>` plate comment to each named function so you
+  can tell which fallback table claimed a name
 
 The scripts are idempotent — safe to re-run; they overwrite types/labels.
 

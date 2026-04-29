@@ -4,10 +4,8 @@ Binary format (from CommonLibF4 IDDatabase::load()):
   uint64  count
   count x (uint64 id, uint64 offset) pairs, sorted by id
 
-Only the AE (1.11.191) database is used.  ``REL::ID``/``RELOCATION_ID``
-relocations from libxse refer to AE offsets, and the IDA fallback names
-in ``extras/IDAImportNames_1.11.191.0.py`` are already AE-keyed, so no
-cross-version rebase is needed.
+Loads the AE (1.11.191) database — the only version supported by libxse and
+the only one targeted by this pipeline.
 """
 
 from __future__ import annotations
