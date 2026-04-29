@@ -231,7 +231,3 @@ non-zero offset points at the most-derived class's secondary struct rather
 than the base's primary.
 
 ---
-
-## License
-
-[MIT](LICENSE)
