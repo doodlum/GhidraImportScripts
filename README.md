@@ -211,15 +211,38 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
     sizeof(T))))` is mapped to `arr:u8:<bytes>`;
   - function-pointer-shape detection (`Ret (*)(args)`, `Ret (Class::*)(args)`,
     `Ret (**)(args)`, `Ret (&)(args)`) collapsed to plain `ptr`;
+  - chained pointer typing: `T **` and `T ***` now wrap as
+    `ptr:ptr:struct:T` instead of collapsing to bare `ptr`, so members like
+    `BGSKeyword** keywords` resolve all the way through the deref chain;
   - 0-byte opaque struct entries for any name referenced as `struct:NAME`
     but not present in `structs`/`enums`, including nested types inside
     template instantiations (`Outer<args>::Inner`) — pointers to them get
     typed in Ghidra instead of `void *`.
 
-  F4 result: unresolved field types dropped from **13.7% → 0.4%**; structured
-  symbol-signature resolution rose to **93.1%**. Remaining ~0.4% is template
-  parameter packs (`Args...`), unspecialised template parameters (single-letter
-  `T`), and clang lambda-typed expressions.
+  F4 result: unresolved field types dropped from **13.7% → 1.1%** (after the
+  pointer-chaining and template-method fixes); structured symbol-signature
+  resolution at **100%** for all primary symbols. Remaining ~1.1% is split
+  between member function-pointer typedefs (intentionally collapsed to plain
+  `ptr`) and template parameter packs / unspecialised parameters.
+- **Template-instantiation methods.** Layout-only template instantiations
+  (e.g. `RE::BSTEventSink<RE::FooEvent>`) used to inherit only the layout
+  from the record-layout dump and lost the template definition's `vmethods`
+  and `methods` dictionaries. A propagation pass copies `vmethods`/`methods`
+  from the template definition `T` onto every `T<args>` instantiation that
+  arrived through any path (layout dump, layout propagation, alias map,
+  forced-layout synthesis), so vtable structs get generated for instantiations
+  too. Vfuncs that came from the clang vtable dump are tagged
+  `_vfuncs_from_dump` and protected from re-computation, so the second AST
+  pass can populate the new instantiations without clobbering exact slot
+  indices.
+- **Anonymous types stripped.** Clang's record-layout dump emits names like
+  `(lambda at PATH:LINE:COL)` and `(anonymous at PATH:LINE:COL)` for unnamed
+  closures and structs. Those names embed absolute file paths from the build
+  machine and aren't useful as Ghidra type names. A post-pass drops every
+  struct whose name (or a fragment thereof — including transitive wrappers
+  like `std::optional<lambda>::_Value`) contains one of those tokens, and
+  rewrites any descriptor referencing them to raw `bytes:<size>` padding so
+  byte footprints are preserved without leaking machine-specific names.
 - **Fallout 4 PDB coverage.** The shipped `Fallout4.pdb` only contains ~11.7k
   real public symbols (the rest are auto-named `FUN_*` placeholders, filtered
   out). The vast majority of named F4 functions therefore come from the

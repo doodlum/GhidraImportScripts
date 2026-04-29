@@ -269,9 +269,10 @@ def _record_type_to_pipeline(raw, root_ns='RE'):
     if raw.endswith('*') or raw.endswith('&'):
         pointee = raw[:-1].strip()
         inner = _record_type_to_pipeline(pointee, root_ns)
-        if inner.startswith('struct:') or inner.startswith('enum:'):
-            return 'ptr:' + inner
-        if inner in ('i8','u8','i16','u16','i32','u32','i64','u64','f32','f64','bool','void'):
+        # Wrap any typed inner descriptor (primitive / struct / enum / nested
+        # ptr / arr).  Only fall back to bare ``ptr`` when the inner itself
+        # was unresolvable, to avoid producing a misleading ``ptr:ptr``.
+        if inner and inner != 'ptr':
             return 'ptr:' + inner
         return 'ptr'
     if raw in _CLANG_TYPE_MAP:
@@ -949,6 +950,24 @@ def _merge_ast_and_layouts(ast_classes, layouts, re_include_path,
         ns_parts = _ns_parts(lname)
         category = category_prefix + '/' + '/'.join(ns_parts) if ns_parts else category_prefix
 
+        # Template instantiations (T<args>) lose their vmethods/methods because
+        # the AST records them on the template definition (T) keyed without
+        # angle brackets.  Look up the definition by stripping <args> at the
+        # outermost level and copy method dictionaries forward so vtable-struct
+        # generation and signature application work for instantiations too.
+        vmethods = {}
+        methods  = {}
+        has_vtbl = ldata['has_vtable']
+        if '<' in lname:
+            tmpl_base = _strip_outer_template(lname)
+            tmpl_def  = ast_classes.get(tmpl_base)
+            if tmpl_def is None and tmpl_base.startswith(ns_prefix):
+                tmpl_def = ast_classes.get(tmpl_base[len(ns_prefix):])
+            if tmpl_def:
+                vmethods = dict(tmpl_def.get('vmethods', {}))
+                methods  = dict(tmpl_def.get('methods',  {}))
+                has_vtbl = has_vtbl or tmpl_def.get('has_vtable', False)
+
         structs[lname] = {
             'name': short,
             'full_name': lname,
@@ -957,11 +976,36 @@ def _merge_ast_and_layouts(ast_classes, layouts, re_include_path,
             'fields': ldata['fields'],
             'bases': bases,
             'pdb_bases': ldata['bases'],
-            'has_vtable': ldata['has_vtable'],
-            'vmethods': {},
+            'has_vtable': has_vtbl,
+            'vmethods': vmethods,
+            'methods':  methods,
         }
 
     return structs
+
+
+def _strip_outer_template(name):
+    """Drop the outermost ``<...>`` cluster from a fully-qualified type name.
+
+    ``RE::BSTEventSink<RE::Foo>``                  -> ``RE::BSTEventSink``
+    ``std::optional<RE::BSTArray<int>>::_Storage`` -> unchanged (the ``<>`` is
+        not at the tail, so the outer template is not what we want to peel)
+    """
+    if '<' not in name:
+        return name
+    # Only strip when the angle bracket cluster covers the tail (or up to '::')
+    depth = 0
+    open_idx = -1
+    for i, ch in enumerate(name):
+        if ch == '<':
+            if depth == 0 and open_idx < 0:
+                open_idx = i
+            depth += 1
+        elif ch == '>':
+            depth -= 1
+            if depth == 0 and i == len(name) - 1:
+                return name[:open_idx]
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1077,11 @@ def _compute_vfuncs(structs, root_ns='RE'):
     count = 0
     for st in structs.values():
         if not st.get('has_vtable'):
+            continue
+        # Don't clobber vfuncs that came from clang -fdump-vtable-layouts —
+        # those are exact and AST-derived counts can disagree with them
+        # (e.g. when AST double-counts an inline destructor).
+        if st.get('_vfuncs_from_dump'):
             continue
         primary_base_names = frozenset()
         base_start = 0
@@ -1489,6 +1538,7 @@ def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
         if not clang_own:
             continue
         st['vfuncs'] = clang_own
+        st['_vfuncs_from_dump'] = True
         replaced += 1
     if verbose and replaced:
         print('Replaced vfuncs with clang vtable dump for {} classes'.format(replaced))
@@ -1497,6 +1547,101 @@ def _apply_vtable_dump(structs, vtable_layouts, root_ns, verbose=False):
 
 _OPAQUE_BAD_FRAGS = ('__attribute__', '*const', '*volatile', 'unnamed', 'lambda',
                      'anonymous', '$', '...', '(*)', '(&)', ' (*', ' (&')
+
+
+_ANON_FRAGS = ('(lambda at ', '(anonymous at ', '(unnamed at ')
+
+
+def _name_is_anonymous(name: str) -> bool:
+    """True for clang-synthesised anonymous type names that embed absolute
+    file paths and line:col positions, e.g. ``(lambda at PATH:L:C)``,
+    ``(anonymous at PATH:L:C)``, ``(unnamed at PATH:L:C)``.
+
+    Such names also taint any wrapper template/nested type whose name contains
+    them as a fragment (e.g. ``std::optional<RE::(lambda at ...)>::_Value``).
+    """
+    if not name:
+        return False
+    return any(frag in name for frag in _ANON_FRAGS)
+
+
+def _strip_anonymous_types(structs: dict, verbose: bool = False) -> int:
+    """Drop struct entries whose full_name (or any name fragment) embeds a
+    clang-synthesised anonymous identifier (lambda / anonymous / unnamed).
+
+    Replaces every descriptor referencing one of those names with a raw
+    ``bytes:<size>`` padding (or bare ``ptr`` when wrapped in ``ptr:``), so
+    fields keep their byte footprint without leaking unportable names into
+    the generated Ghidra script.
+    """
+    anon_keys = [k for k in structs if _name_is_anonymous(k)]
+    anon_set  = set(anon_keys)
+
+    def _rewrite(desc: str, byte_size=None) -> str:
+        """Rewrite a descriptor that references an anonymous type."""
+        if not desc:
+            return desc
+        if desc.startswith('ptr:'):
+            inner = _rewrite(desc[4:], None)
+            if inner == 'ptr' or inner == '':
+                return 'ptr'
+            return 'ptr:' + inner
+        if desc.startswith('arr:'):
+            rest = desc[4:]
+            last = rest.rfind(':')
+            if last > 0 and rest[last+1:].isdigit():
+                inner = _rewrite(rest[:last], None)
+                count = rest[last+1:]
+                if inner.startswith('struct:') or inner == 'ptr' or inner == '':
+                    return 'arr:u8:{}'.format(int(count))
+                return 'arr:{}:{}'.format(inner, count)
+        if desc.startswith('struct:'):
+            ref = desc[7:]
+            if _name_is_anonymous(ref):
+                if byte_size and byte_size > 0:
+                    return 'bytes:{}'.format(byte_size)
+                return 'ptr'
+        return desc
+
+    rewrites = 0
+    for st in structs.values():
+        if _name_is_anonymous(st.get('full_name', '')):
+            continue  # will be dropped; no need to rewrite its own fields
+        for f in st.get('fields', []):
+            new = _rewrite(f.get('type', ''), f.get('size', 0))
+            if new != f.get('type'):
+                f['type'] = new
+                rewrites += 1
+        # Also rewrite vmethod / method signatures
+        for mdict_key in ('vmethods', 'methods'):
+            mdict = st.get(mdict_key) or {}
+            for mname, info in list(mdict.items()):
+                if mdict_key == 'vmethods':
+                    ret, params = info
+                else:
+                    ret, params, is_static = info
+                new_ret = _rewrite(ret, None)
+                new_params = [(pn, _rewrite(pt, None)) for pn, pt in params]
+                if new_ret != ret or new_params != params:
+                    if mdict_key == 'vmethods':
+                        mdict[mname] = (new_ret, new_params)
+                    else:
+                        mdict[mname] = (new_ret, new_params, is_static)
+                    rewrites += 1
+        # Filter out anonymous bases (they were placeholders anyway)
+        if st.get('bases'):
+            st['bases'] = [b for b in st['bases'] if not _name_is_anonymous(b)]
+        if st.get('pdb_bases'):
+            st['pdb_bases'] = [(b, off) for (b, off) in st['pdb_bases']
+                               if not _name_is_anonymous(b)]
+
+    for k in anon_keys:
+        del structs[k]
+
+    if verbose and (anon_keys or rewrites):
+        print('Stripped {} anonymous-type entries; rewrote {} descriptors'.format(
+            len(anon_keys), rewrites))
+    return len(anon_keys)
 
 _OPAQUE_PLAIN_NAME_RE  = re.compile(r'^[A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*$')
 # Nested type inside a template instantiation:  Outer<args>::Inner[::Inner2...]
@@ -1707,6 +1852,41 @@ def _force_template_layouts(structs, header_path, parse_args, clang_binary,
     return filled
 
 
+def _propagate_template_methods(structs, ast_classes, root_ns='RE'):
+    """Copy vmethods/methods from each template definition onto every
+    instantiation that doesn't have them yet.
+
+    Template instantiations enter ``structs`` from three sources — the layout
+    dump, ``_propagate_template_layouts``, and ``template_types``' alias map —
+    and only the first path runs through the merge that copies AST methods.
+    Running this pass at the end ensures every ``T<args>`` entry carries the
+    same ``vmethods``/``methods`` dictionaries as its template definition
+    ``T``, which is what vtable-struct generation needs to produce typed
+    ``__vftable`` pointers for instantiations.
+    """
+    ns_pre = root_ns + '::'
+    propagated = 0
+    for key, st in structs.items():
+        if '<' not in key:
+            continue
+        if st.get('vmethods') and st.get('methods'):
+            continue
+        tmpl_base = _strip_outer_template(key)
+        tmpl_def  = ast_classes.get(tmpl_base)
+        if tmpl_def is None and tmpl_base.startswith(ns_pre):
+            tmpl_def = ast_classes.get(tmpl_base[len(ns_pre):])
+        if tmpl_def is None:
+            continue
+        if not st.get('vmethods'):
+            st['vmethods'] = dict(tmpl_def.get('vmethods', {}))
+        if not st.get('methods'):
+            st['methods']  = dict(tmpl_def.get('methods', {}))
+        if tmpl_def.get('has_vtable'):
+            st['has_vtable'] = True
+        propagated += 1
+    return propagated
+
+
 def _propagate_template_layouts(structs):
     """Fill empty template placeholders from known instantiations of the same template.
 
@@ -1896,6 +2076,25 @@ def collect_types(header_path, include_path, parse_args,
             print('Forced layout for {} template instantiations via synthesis pass'.format(_forced))
     except ImportError:
         pass
+
+    # --- Propagate vmethods/methods from template definitions onto every
+    # instantiation that doesn't have them yet (covers ones that came in
+    # via _propagate_template_layouts / template_map / forced layouts).
+    _propagated_methods = _propagate_template_methods(
+        structs, ast_classes, root_ns=root_namespace)
+    if verbose and _propagated_methods:
+        print('Propagated template-definition methods to {} instantiations'.format(
+            _propagated_methods))
+
+    # --- Re-run vfunc computation so newly-populated vmethods get vtable slots.
+    _compute_vfuncs(structs, root_ns=root_namespace)
+
+    # --- Strip clang-internal anonymous types (lambdas, unnamed structs) ---
+    # Their names embed absolute paths (``(lambda at D:\path\file.h:LINE:COL)``)
+    # which aren't portable, and they're not user-meaningful in Ghidra anyway.
+    # Drop the entries themselves and rewrite any field/method descriptor
+    # that referenced them so callers don't see a dangling ``struct:<anon>``.
+    _strip_anonymous_types(structs, verbose=verbose)
 
     # --- Generate opaque structs for forward-declared types still referenced ---
     _add_opaque_for_forward_decls(
