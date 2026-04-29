@@ -6,7 +6,7 @@ for Fallout 4 AE (1.11.191).
 Pipeline:
   Types:        core/clang_types.py  (clang AST dump + record layouts)
   Relocations:  reloc_parser.py      (IDs.h map + ID::Class::Method references)
-  Address lib:  address_library.py   (1-11-191 AE; 1-10-984 NG used to rebase PDB)
+  Address lib:  address_library.py   (1-11-191 AE)
   Script gen:   core/ghidra_import_gen.py
 
 Generates:
@@ -101,7 +101,6 @@ def main():
     addr_lib = F4AddressLibrary()
     addr_lib.load_all(ADDRLIB_DIR)
     print(f'AE address library: {len(addr_lib.ae_db):,} entries')
-    print(f'NG address library: {len(addr_lib.ng_db):,} entries (PDB rebase)')
 
     # --- Relocation scan ---
     print('\n=== Collecting symbols via relocation parser ===')
@@ -172,30 +171,23 @@ def main():
     _flatten_structs(structs)
     _apply_secondary_vtable_typing(structs)
 
-    # --- Fallout4.pdb fallback symbols (rebased NG -> AE) ---
-    print('\n=== Loading Fallout4.pdb fallback symbols (1.10.984 NG -> 1.11.191 AE) ===')
-    from pdb_symbols import load_pdb_names as _load_pdb
-    f4_pdb_path = os.path.join(PROJECT_DIR, 'extras', 'Fallout4.pdb')
-    pdb_names = _load_pdb(f4_pdb_path)
-    print(f'PDB: {len(pdb_names):,} public symbols')
+    # --- IDAImportNames_1.11.191.0.py fallback symbols (already AE) ---
+    print('\n=== Loading IDAImportNames_1.11.191.0.py fallback symbols ===')
+    from ida_names import load_ida_import_names as _load_ida
+    f4_ida_path = os.path.join(PROJECT_DIR, 'extras', 'IDAImportNames_1.11.191.0.py')
+    ida_names = _load_ida(f4_ida_path)
+    print(f'IDA names: {len(ida_names):,} entries')
 
     primary_rvas = {s['a'] for s in symbols if s.get('a')}
-    pdb_fallback = []
-    rebased = 0
-    unmapped = 0
-    for rva_ng, name in pdb_names.items():
-        ae_rva = addr_lib.rva_ng_to_ae(rva_ng)
-        if ae_rva is None:
-            unmapped += 1
-            continue
-        rebased += 1
-        sym = {'n': name, 't': 'func', 'sig': '', 'a': ae_rva, 'src': 'Fallout4.pdb'}
-        pdb_fallback.append(sym)
-    print(f'PDB fallback symbols: {rebased:,} rebased onto AE '
-          f'({unmapped:,} unmapped, '
-          f'{sum(1 for s in pdb_fallback if s["a"] not in primary_rvas):,} not in primary)')
+    ida_fallback = [
+        {'n': name, 't': 'func', 'sig': '', 'a': rva, 'src': 'IDAImportNames'}
+        for rva, name in ida_names.items()
+    ]
+    not_in_primary = sum(1 for s in ida_fallback if s['a'] not in primary_rvas)
+    print(f'IDA fallback symbols: {len(ida_fallback):,} loaded '
+          f'({not_in_primary:,} not in primary)')
 
-    fallback_json = _json.dumps(pdb_fallback, separators=(',', ':'))
+    fallback_json = _json.dumps(ida_fallback, separators=(',', ':'))
 
     # --- Generate AE script ---
     print('\nGenerating Ghidra script...')

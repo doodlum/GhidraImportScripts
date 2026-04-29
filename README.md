@@ -12,9 +12,6 @@ Skyrim AE, and Fallout 4 AE binaries.
 | Skyrim AE      | `ae`          | `1-6-1170-0`        | `powerof3/CommonLibSSE` |
 | Fallout 4 AE   | `ae`          | `1-11-191-0`        | `libxse/commonlibf4` |
 
-Fallout 4 OG (1.10.163) is **not** supported. The `extras/Fallout4.pdb` is from
-1.10.984 ("NG"); its symbols are rebased onto 1.11.191 (AE) via `RVA → 984 ID →
-191 RVA` lookup.
 
 ---
 
@@ -30,10 +27,9 @@ Fallout 4 OG (1.10.163) is **not** supported. The `extras/Fallout4.pdb` is from
 │   ├── sse/version-1-5-97-0.bin     SE
 │   ├── sse/versionlib-1-6-1170-0.bin AE
 │   └── f4/version-1-11-191-0.bin    F4 AE (primary)
-│       version-1-10-984-0.bin       F4 NG (used to rebase the PDB)
 ├── extras/
 │   ├── SkyrimSE.pdb                 fallback symbol names for Skyrim SE
-│   └── Fallout4.pdb                 fallback symbol names for F4 (NG 1.10.984)
+│   └── IDAImportNames_1.11.191.0.py fallback symbol names for F4 AE
 ├── exes/
 │   ├── skyrim/se/SkyrimSE.exe
 │   ├── skyrim/ae/SkyrimSE.exe
@@ -55,7 +51,8 @@ Fallout 4 OG (1.10.163) is **not** supported. The `extras/Fallout4.pdb` is from
     └── commonlibf4/
         ├── parse_commonlib_types.py Generates F4 AE script
         ├── reloc_parser.py          libxse single-ID regex scanner
-        └── address_library.py       AE primary; NG inverted for PDB rebase
+        ├── address_library.py       AE address library loader
+        └── ida_names.py             Parses extras/IDAImportNames_*.py
 ```
 
 ---
@@ -127,9 +124,8 @@ addresslibrary/<game>/*.bin   ─── address_library.py      ──┘
 extern/CommonLib*/include/    ─── clang -ast-dump         ──► enums, classes, methods, vtables
                               ─── clang -fdump-record-layouts ─► struct field offsets + sizes
 
-extras/<game>.pdb             ─── pdb_symbols.py          ──► fallback symbols
-                                                              (Fallout4.pdb is rebased
-                                                               1.10.984 NG → 1.11.191 AE)
+extras/SkyrimSE.pdb           ─── pdb_symbols.py          ──► Skyrim fallback symbols
+extras/IDAImportNames_*.py    ─── ida_names.py            ──► F4 fallback symbols
 
 parse_commonlib_types.py      ─── orchestrates each game ─┐
 ghidra_import_gen.py          ─── emits the .py script ───┴─► ghidrascripts/CommonLibImport_*.py
@@ -142,10 +138,11 @@ ghidra_import_gen.py          ─── emits the .py script ───┴─► 
 3. `RE::Offset::` namespace IDs (Skyrim)
 4. CommonLibSSE `src/*.cpp` cross-references (Skyrim only)
 5. Fallback: AE rename DB (`skyrimae.rename`) — Skyrim AE only
-6. Fallback: PDB public symbols (`SkyrimSE.pdb`, `Fallout4.pdb`-rebased)
+6. Fallback: PDB public symbols (`SkyrimSE.pdb`) — Skyrim
+7. Fallback: IDA `NAME(addr, …)` script (`IDAImportNames_1.11.191.0.py`) — F4 AE
 
-Vtable slots known from the AST upgrade matching fallback symbols' source from
-PDB/rename to the CommonLib name, so they appear under
+Vtable slots known from the AST upgrade matching fallback symbols' source
+from PDB/rename/IDA to the CommonLib name, so they appear under
 `/CommonLibSSE/` or `/CommonLibF4/` in the Data Type Manager.
 
 ---
@@ -208,10 +205,11 @@ that genuinely *are* opaque pointers in the source:
   signature with `T*` (which would resolve to `void*` in Ghidra and so
   silently mis-type the argument), the orchestrators skip the signature
   entirely and only apply the function's name. ~2-3 such symbols per game.
-- **PDB coverage.** The shipped `Fallout4.pdb` contains ~11.7k real public
-  symbols (the rest are auto-named `FUN_*` placeholders, filtered out). The
-  vast majority of named F4 functions come from the CommonLibF4 ID database,
-  not the PDB. `SkyrimSE.pdb` is similarly thinned.
+- **Fallback-symbol coverage.** F4 fallback names come from the IDA script
+  `extras/IDAImportNames_1.11.191.0.py` (3,639 hand-named addresses), so
+  most F4 names still come from the CommonLibF4 ID database; the IDA script
+  fills in helpers and globals that have no `REL::ID` mapping. Skyrim
+  fallback names come from `extras/SkyrimSE.pdb`'s public-symbol table.
 - **Special-character template names.** A handful of x86 emit-helper templates
   use byte literals as non-type template arguments (`BRANCH5<'\xe8'>`,
   `BRANCH6<'\x15'>`); the resulting struct names contain backslash escapes.
