@@ -168,117 +168,62 @@ The scripts are idempotent — safe to re-run; they overwrite types/labels.
 
 ## Known limitations
 
-- **Template layouts.** A third clang pass (`-fdump-record-layouts` over a
-  synthetic `struct sN { T<...> _; }` for each unfilled template) forces
-  instantiation of templates the orchestrator header never used. ~95% of
-  empty placeholders get real layouts; the only stragglers are
-  malformed names from clang's lambda-numbering (e.g. `Allocator<24, RE::8>`).
-- **Vtable slots.** A 4th clang pass synthesises `auto u<N> = &Class::Method;`
-  (one per polymorphic class) and runs `-S -emit-llvm -Xclang
-  -fdump-vtable-layouts`, which yields exact slot indices for every primary
-  vtable. The address-of-virtual-member trick avoids destructor instantiation,
-  so it sidesteps the `BSTSmartPointer<incomplete-type>` and ambiguous
-  `operator delete` errors that block `delete t` / `t->~T()`.
-  A two-stage compile (`-fsyntax-only` to filter overload-ambiguous
-  declarations, then real codegen) recovers usable data even when the
-  candidate set has bad picks. The clang slot map replaces AST-computed
-  `vfuncs` for ~95% of polymorphic classes, fixing destructor-position
-  miscounts that previously truncated vtable structs (e.g. F4 `Actor_vtbl`:
-  299 → 307 components).
-  Secondary vtable IDs from multi-inheritance — `std::array<REL::ID, N>`
-  arrays in `IDs_VTABLE.h` / `Offsets_VTABLE.h` with N > 1 — are emitted as
-  `VTABLE_<Class>_2`, `VTABLE_<Class>_3`, ... so all of a class's vtables get
-  labeled. The unnamed-walk pass labels their slot functions as
-  `Class::Func1_v2`, `Class::Func2_v2`, etc.
+The pipeline guarantees correctness as a hard rule: every emitted struct field
+or signature parameter points at the **exact** type declared in the source.
+Anything we can't pin to an exact type is left as bare `ptr` (Ghidra renders
+this as `void *`) instead of being upgraded to a guessed type. Counts below
+are from the most recent run.
 
-  Per-class typed secondary vtable structs are also generated from the dump's
-  `VFTable for B in C` blocks: each `[this adjustment: -N non-virtual]`
-  annotation gives the subobject offset, and a struct named
-  `<Class>_vtbl_<offset>` is emitted with the slot names from clang. A
-  post-flatten pass rewrites every `__vftable_<base>` field at non-zero
-  offset in C's flattened layout to point at C's secondary struct instead of
-  B's primary, so multi-inheritance vfptr fields type-correctly per
-  most-derived class.
-- **Type resolution in signatures.** Almost all `void *` fallbacks have been
-  removed via:
-  - `using X = Y;` alias extraction from the AST and descriptor rewriting
-    (with each struct's `full_name` as `class_scope` so class-local typedefs
-    like `Foo::EventSource_t` resolve);
-  - `const`/`volatile`/`restrict` stripping (including `T *const`);
-  - primitive map entries for `_Bool`, `std::byte`, `wchar_t`, `char16_t`,
-    `char32_t`, `char8_t`, `__int128`, `long double`;
-  - SIMD vector detection: clang's `__attribute__((__vector_size__(N *
-    sizeof(T))))` is mapped to `arr:u8:<bytes>`;
-  - function-pointer-shape detection (`Ret (*)(args)`, `Ret (Class::*)(args)`,
-    `Ret (**)(args)`, `Ret (&)(args)`) collapsed to plain `ptr`;
-  - chained pointer typing: `T **` and `T ***` now wrap as
-    `ptr:ptr:struct:T` instead of collapsing to bare `ptr`, so members like
-    `BGSKeyword** keywords` resolve all the way through the deref chain;
-  - 0-byte opaque struct entries for any name referenced as `struct:NAME`
-    but not present in `structs`/`enums`, including nested types inside
-    template instantiations (`Outer<args>::Inner`) — pointers to them get
-    typed in Ghidra instead of `void *`.
+| | F4 AE | Skyrim AE | Skyrim SE |
+| --- | --- | --- | --- |
+| Total struct fields | 24,216 | 34,243 | 34,231 |
+| Bare-`ptr` fields | 58 (0.24%) | 84 (0.25%) | 84 (0.25%) |
+| Signatures with unresolved template params | 0 | 0 | 0 |
+| Struct fields referencing unresolved template params | 0 | 0 | 0 |
+| Vtable structs built | 1,292 | 2,023 | 2,024 |
 
-  F4 result: unresolved field types dropped from **13.7% → 0.30%** (after
-  pointer-chaining, template-method propagation, sibling-namespace AST scope,
-  and `std::` AST inclusion); Skyrim AE/SE: **0.36%**. Structured
-  symbol-signature resolution at **100%** for all primary symbols. The
-  remaining 0.30–0.36% is mostly member function-pointer typedefs
-  (intentionally collapsed to plain `ptr`) and a handful of stdlib stream
-  internals (`basic_ostream`, `basic_ostringstream`) whose virtual-method
-  declarations live in MSVC headers outside the project's include scope.
-- **AST scope.** `_parse_ast_dump`'s in-scope test originally fired only on
-  the configured root namespace (`RE`) and on file paths under the main
-  include directory. Sibling top-level namespaces (`REL`, `REX`, `F4SE`,
-  `SKSE`, `Scaleform`) and `std` were silently skipped, so all the IUnknown /
-  D3D11 / Scaleform / std-stream classes inherited via CommonLib's interface
-  shims kept their `vmethods` empty — and their derived classes ended up
-  with bare `__vftable` pointers.  The fix:
-  1. `extra_scope_paths` parameter on `collect_types`, plumbed in by both
-     orchestrators, lets the parser accept any AST decl whose source location
-     is under a configured commonlib subdirectory (covers REL/REX/F4SE/SKSE).
-  2. NamespaceDecl now sets `in_re=True` on three additional triggers: the
-     namespace's own source location matches a scope path, the namespace
-     name equals the configured root, or the namespace is `std` (so user
-     classes deriving from `std::runtime_error`, `std::exception`,
-     `std::function` chains pick up the inherited virtual slots).
-  3. `nested` and `inline` modifier tokens that clang appends after the
-     namespace name in `namespace A::B {}` declarations are now stripped
-     before the trailing token is read as the namespace name — previously
-     classes inside such blocks were silently filed under a bogus
-     `RE::nested::...` namespace and lost all their AST methods.
-  4. Numeric / boolean / string literals appearing as template arguments
-     (`<16>`, `<false>`, `<"foo">`) are no longer wrongly rewritten to
-     `RE::16`, `RE::false`, etc. by the qualifier — `_qualify_type`'s leaf
-     branch defers to `_ensure_qualified` so non-type tokens pass through.
+The remaining ~0.25% bare-`ptr` fields fall into a small number of categories
+that genuinely *are* opaque pointers in the source:
 
-  Combined effect: ~5,200 bad-named template instantiations vanished, vtable
-  struct count went from 1,075 → **1,292** (F4) and 1,825 → **2,024**
-  (Skyrim), template-method propagation jumped to **26,671** instantiations
-  (was 1,771).
-- **Template-instantiation methods.** Layout-only template instantiations
-  (e.g. `RE::BSTEventSink<RE::FooEvent>`) used to inherit only the layout
-  from the record-layout dump and lost the template definition's `vmethods`
-  and `methods` dictionaries. A propagation pass copies `vmethods`/`methods`
-  from the template definition `T` onto every `T<args>` instantiation that
-  arrived through any path (layout dump, layout propagation, alias map,
-  forced-layout synthesis), so vtable structs get generated for instantiations
-  too. Vfuncs that came from the clang vtable dump are tagged
-  `_vfuncs_from_dump` and protected from re-computation, so the second AST
-  pass can populate the new instantiations without clobbering exact slot
-  indices.
-- **Anonymous types stripped.** Clang's record-layout dump emits names like
-  `(lambda at PATH:LINE:COL)` and `(anonymous at PATH:LINE:COL)` for unnamed
-  closures and structs. Those names embed absolute file paths from the build
-  machine and aren't useful as Ghidra type names. A post-pass drops every
-  struct whose name (or a fragment thereof — including transitive wrappers
-  like `std::optional<lambda>::_Value`) contains one of those tokens, and
-  rewrites any descriptor referencing them to raw `bytes:<size>` padding so
-  byte footprints are preserved without leaking machine-specific names.
-- **Fallout 4 PDB coverage.** The shipped `Fallout4.pdb` only contains ~11.7k
-  real public symbols (the rest are auto-named `FUN_*` placeholders, filtered
-  out). The vast majority of named F4 functions therefore come from the
-  CommonLibF4 ID database, not the PDB.
+- **Function-pointer typedef fields.** Members declared as a pointer to a
+  named function-type alias (e.g. Havok `ShapeFuncs::getSupportingVertexFunc`,
+  `BSAudioCallbacks::idCallback`, the various `_readFn` / `_writeFn`
+  callbacks) are 8-byte function pointers but the pipeline doesn't currently
+  emit a Ghidra `FunctionDefinitionDataType` for the typedef, so the field is
+  typed as plain `ptr`. The byte layout is exact; only the parameter
+  annotation is missing. Skyrim contains ~24 such fields in `ShapeFuncs` /
+  `ShapeFuncs2` and a handful elsewhere.
+- **Type-erased STL containers.** `std::_Tree_node<..., void*>` and similar
+  STL nodes use `void*` as their second template argument, which makes
+  `_Left` / `_Right` / `_Parent` truly `void*` at the source level. The
+  bare `ptr` type is correct here.
+- **STL stream classes.** `basic_ostream`, `basic_ostringstream`, `ios_base`
+  and a handful of related types have `has_vtable=True` but their virtual
+  destructors / methods are declared in MSVC headers we don't pull in. Their
+  derived `__vftable` pointers stay bare. F4: 6 fields, Skyrim: 7 fields.
+- **Skipped uninstantiated-template signatures.** Template member functions
+  whose RELOCATION_ID lives on the unspecialised template (e.g.
+  `BSPointerHandleManagerInterface<T>::CreateHandle(T*)`) have a parameter
+  type that's literally the template parameter `T`. Rather than apply a
+  signature with `T*` (which would resolve to `void*` in Ghidra and so
+  silently mis-type the argument), the orchestrators skip the signature
+  entirely and only apply the function's name. ~2-3 such symbols per game.
+- **PDB coverage.** The shipped `Fallout4.pdb` contains ~11.7k real public
+  symbols (the rest are auto-named `FUN_*` placeholders, filtered out). The
+  vast majority of named F4 functions come from the CommonLibF4 ID database,
+  not the PDB. `SkyrimSE.pdb` is similarly thinned.
+- **Special-character template names.** A handful of x86 emit-helper templates
+  use byte literals as non-type template arguments (`BRANCH5<'\xe8'>`,
+  `BRANCH6<'\x15'>`); the resulting struct names contain backslash escapes.
+  They work in Ghidra but render unusually in the Data Type Manager.
+
+Outside that, every struct field's offset, size, and (where typed) referenced
+type matches what clang emits for the layout. Vtable structs include exact
+slot indices from clang's `-fdump-vtable-layouts` (preferred) or the AST
+fallback, and per-(class, subobject offset) secondary vtable structs are
+generated for multi-inheritance so each `__vftable_<base>` field at a
+non-zero offset points at the most-derived class's secondary struct rather
+than the base's primary.
 
 ---
 

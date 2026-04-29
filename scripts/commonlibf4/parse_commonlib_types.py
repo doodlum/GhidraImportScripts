@@ -31,6 +31,21 @@ OUTPUT_DIR        = os.path.join(PROJECT_DIR, 'ghidrascripts')
 ADDRLIB_DIR       = os.path.join(PROJECT_DIR, 'addresslibrary', 'f4')
 
 
+# A descriptor that ends in a single-letter uppercase qualified path is an
+# uninstantiated template parameter (``T``, ``K``, ``V``...).  Signatures
+# containing such tokens can't point at ``the exact correct type`` and are
+# dropped instead of being applied with a stale ``RE::T`` placeholder.
+_UNRESOLVED_TPARAM_RE = re.compile(r'(?:^|[:>])([A-Z])(?=$|\W)')
+
+
+def _has_unresolved_tparam(desc):
+    if not desc:
+        return False
+    if 'struct:' not in desc and 'enum:' not in desc:
+        return False
+    return bool(_UNRESOLVED_TPARAM_RE.search(desc))
+
+
 def _enrich_symbols(symbols_list, structs):
     structs_by_suffix = {}
     for key, val in structs.items():
@@ -40,6 +55,7 @@ def _enrich_symbols(symbols_list, structs):
             if suffix not in structs_by_suffix:
                 structs_by_suffix[suffix] = val
     enriched = 0
+    skipped = 0
     for sym in symbols_list:
         if sym['t'] != 'func' or sym.get('sd'):
             continue
@@ -55,10 +71,18 @@ def _enrich_symbols(symbols_list, structs):
         info = st.get('methods', {}).get(method_name)
         if info:
             ret, params, is_static = info
+            # Reject signatures containing uninstantiated template parameters
+            # (e.g. ``T*`` from a class template's method) — they would resolve
+            # to ``void*`` in Ghidra and mask the real types in the binary.
+            if _has_unresolved_tparam(ret) or any(_has_unresolved_tparam(p[1]) for p in params):
+                skipped += 1
+                continue
             sym['sd'] = [ret, params, 1 if is_static else 0]
             enriched += 1
     if enriched:
         print(f'Enriched {enriched} symbols with AST method signatures')
+    if skipped:
+        print(f'Skipped {skipped} symbols with uninstantiated template params in signature')
 
 
 def main():

@@ -1148,6 +1148,74 @@ def _generalize_field(f):
     return f
 
 
+def _tmpl_args_of(name):
+    """Return the outermost template argument list of ``name`` as a list of
+    qualified type strings, or ``None`` if ``name`` is not a template
+    instantiation.
+
+    ``RE::BSTArray<RE::Actor *, RE::BSTSmallArrayHeapAllocator<8>>``
+        -> [``RE::Actor *``, ``RE::BSTSmallArrayHeapAllocator<8>``]
+    """
+    if '<' not in name or not name.endswith('>'):
+        return None
+    lt = name.find('<')
+    inner = name[lt + 1:-1]
+    return _split_tmpl_args(inner)
+
+
+_DESC_TYPE_ARG_RE = re.compile(r'(?<![A-Za-z0-9_:])([A-Za-z_][\w:]*(?:<[^<>]*>)?)(?![A-Za-z0-9_])')
+
+
+def _substitute_template_args(desc, donor_args, recipient_args):
+    """Rewrite a pipeline descriptor produced for ``donor_args`` so it refers
+    to ``recipient_args`` instead.
+
+    Used by template-layout propagation: when ``BSTArray<int>`` lends its
+    layout to the empty placeholder ``BSTArray<float>``, every occurrence of
+    ``int`` inside the field type strings should become ``float``, etc.
+    The substitution is bounded to whole-token matches (no partial matches
+    inside longer identifiers).
+    """
+    if not desc or len(donor_args) != len(recipient_args):
+        return desc
+    # Apply the longest tokens first so a substring of one arg cannot match
+    # before the longer arg containing it gets rewritten.
+    pairs = sorted(zip(donor_args, recipient_args), key=lambda p: -len(p[0]))
+    out = desc
+    for d, r in pairs:
+        if d == r or not d:
+            continue
+        # Whole-token replacement: don't match in the middle of an identifier
+        # or as a sub-element of a qualified path.
+        pattern = r'(?<![A-Za-z0-9_:])' + re.escape(d) + r'(?![A-Za-z0-9_:])'
+        out = re.sub(pattern, r, out)
+    return out
+
+
+def _retype_field_for_instantiation(f, donor_args, recipient_args):
+    """Copy a donor field, substituting donor template args -> recipient
+    template args inside the type descriptor.  Falls back to the original
+    generalisation behaviour for fields whose type doesn't reference any
+    template parameter (so multi-instantiation propagation stays sound).
+    """
+    f = dict(f)
+    new_type = _substitute_template_args(f.get('type', ''),
+                                         donor_args, recipient_args)
+    if new_type != f.get('type'):
+        f['type'] = new_type
+    else:
+        # Type didn't reference any template argument — generalise to keep
+        # the original behaviour (e.g. ``int* _data`` in BSTArray<int> stays
+        # generic when propagated to BSTArray<float>).
+        f = _generalize_field(f)
+    return f
+
+
+def _retype_base_for_instantiation(base_name, donor_args, recipient_args):
+    """Substitute template args in a base-class name string."""
+    return _substitute_template_args(base_name, donor_args, recipient_args)
+
+
 _TEMPLATE_NAME_BAD = re.compile(r'(?:^|::)\d')          # e.g. 'RE::8'
 _ANGLE_INNER       = re.compile(r'<[^<>]*>')
 
@@ -1825,9 +1893,29 @@ def _force_template_layouts(structs, header_path, parse_args, clang_binary,
     """
     import tempfile
 
-    empty = [k for k, s in structs.items()
-             if '<' in k and s['size'] == 0 and not s['fields']]
-    candidates = [n for n in empty if _is_safe_template_name(n)]
+    def _all_fields_generic(st):
+        """True iff every field is bare ``ptr`` or padding — i.e. nothing in
+        the layout would be lost by re-running synthesis."""
+        if not st['fields']:
+            return True
+        for f in st['fields']:
+            t = f.get('type', '')
+            if t and t != 'ptr' and not t.startswith('bytes:'):
+                return False
+        return True
+
+    # Process both empty entries AND entries whose fields are all generic
+    # ptr/padding — those came from propagation with a shape-mismatched donor
+    # and synthesis can produce a more accurate layout.
+    candidates_keys = [
+        k for k, s in structs.items()
+        if '<' in k and (
+            (s['size'] == 0 and not s['fields'])
+            or _all_fields_generic(s)
+        )
+    ]
+    candidates = [n for n in candidates_keys if _is_safe_template_name(n)]
+    empty = candidates_keys  # used below for the merge step
     if not candidates:
         return 0
 
@@ -1942,14 +2030,56 @@ def _propagate_template_layouts(structs):
         if len(sizes) != 1:
             continue
         donor_size = sizes.pop()
-        donor = has_layout[0][1]
+        donor_key, donor = has_layout[0]
+        donor_args = _tmpl_args_of(donor_key) or []
+        # If a donor template arg appears anywhere in the donor's field types,
+        # the field shape depends on the arg — propagating to a sibling
+        # instantiation would require substitution.  Skip when substitution
+        # can't replicate the shape exactly so the synthesis pass downstream
+        # can produce an accurate layout instead of leaving generic ``ptr``.
+        donor_field_text = ' '.join(f.get('type', '') for f in donor['fields'])
+        donor_arg_appears = any(
+            a and a in donor_field_text for a in donor_args
+        )
         for key, st in empty:
+            recipient_args = _tmpl_args_of(key) or []
+            # If the donor's args reference fields but the recipient's args
+            # have a different shape (e.g. donor ``void*`` vs recipient
+            # ``RE::Actor``), defer to synthesis instead of polluting the
+            # entry with un-substituted fields.
+            if donor_arg_appears and not _args_substitutable(donor_args, recipient_args):
+                continue
             st['size'] = donor_size
-            st['fields'] = [_generalize_field(f) for f in donor['fields']]
-            st['bases'] = list(donor['bases'])
+            st['fields'] = [
+                _retype_field_for_instantiation(f, donor_args, recipient_args)
+                for f in donor['fields']
+            ]
+            st['bases'] = [
+                _retype_base_for_instantiation(b, donor_args, recipient_args)
+                for b in donor['bases']
+            ]
             st['has_vtable'] = donor['has_vtable']
             propagated += 1
     return propagated
+
+
+def _args_substitutable(donor_args, recipient_args):
+    """Return True iff donor->recipient template-arg substitution can be
+    expressed as token-level rewrites (same shape: same pointer/reference
+    suffixes on each positional argument).  Differing shapes must be left to
+    the synthesis pass, since substring substitution would mismatch indirection
+    levels (e.g. donor ``void *`` vs recipient ``RE::Actor``).
+    """
+    if len(donor_args) != len(recipient_args):
+        return False
+    def _suffix(s):
+        s = s.rstrip()
+        n = 0
+        while s.endswith(('*', '&')):
+            n += 1
+            s = s[:-1].rstrip()
+        return n
+    return all(_suffix(d) == _suffix(r) for d, r in zip(donor_args, recipient_args))
 
 
 # ---------------------------------------------------------------------------
