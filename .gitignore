@@ -1,7 +1,5 @@
-build*/
-plugin/build*/
-/.vs
-/plugin/.vs
-/pdbs
-/__pycache__
 /ghidrascripts
+/exes
+/ghidra
+__pycache__
+/ghidraprojects

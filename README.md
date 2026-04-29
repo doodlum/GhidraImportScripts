@@ -1,495 +1,234 @@
-#  Ghidra Import Scripts
+# Ghidra Import Scripts
 
-Toolchain that reverse-engineers Skyrim SE/AE by importing CommonLibSSE type definitions,
-vtable layouts, and function signatures into Ghidra.
+Generates Ghidra import scripts that apply CommonLib type definitions, vtable
+layouts, function signatures, and address-library-derived symbols to Skyrim SE,
+Skyrim AE, and Fallout 4 AE binaries.
 
-## Table of Contents
+## Supported game versions
 
-1. [Project Layout](#project-layout)
-2. [Plugin Build](#plugin-build)
-3. [Ghidra Pipeline Overview](#ghidra-pipeline-overview)
-4. [Prerequisites](#prerequisites)
-5. [Setup](#setup)
-6. [Running the Generator](#running-the-generator)
-7. [Running the Ghidra Scripts](#running-the-ghidra-scripts)
-8. [Pipeline Files Reference](#pipeline-files-reference)
-9. [extra\_types.json Reference](#extra_typesjson-reference)
-10. [template\_types.py Reference](#template_typespy-reference)
-11. [Known Limitations](#known-limitations)
+| Game           | Version label | Address library     | CommonLib repo       |
+|----------------|---------------|---------------------|----------------------|
+| Skyrim SE      | `se`          | `1-5-97-0`          | `powerof3/CommonLibSSE` |
+| Skyrim AE      | `ae`          | `1-6-1170-0`        | `powerof3/CommonLibSSE` |
+| Fallout 4 AE   | `ae`          | `1-11-191-0`        | `libxse/commonlibf4` |
+
 
 ---
 
-## Project Layout
+## Project layout
 
 ```
-GhidraImportScripts/
-├── plugin/                     SKSE plugin build project
-│   ├── src/                    C++ source files
-│   ├── cmake/                  CMake helpers (version templates, triplets)
-│   ├── CMakeLists.txt
-│   ├── CMakePresets.json
-│   └── vcpkg.json
+.
 ├── extern/
-│   ├── CommonLibSSE/           CommonLibSSE submodule (powerof3/dev branch)
-│   └── AddressLibraryDatabase/ Includes AE rename database
+│   ├── CommonLibSSE/                powerof3/CommonLibSSE
+│   ├── CommonLibF4/                 libxse/commonlibf4 (+ commonlib-shared)
+│   └── AddressLibraryDatabase/      meh321 — provides skyrimae.rename
 ├── addresslibrary/
-│   ├── version-1-5-97-0.bin       SE address library
-│   └── versionlib-1-6-1170-0.bin  AE address library
-├── pdbs/
-│   ├── GhidraImport_SE_D.pdb   SE debug PDB — written here by the plugin build
-│   ├── GhidraImport_AE_D.pdb   AE debug PDB — written here by the plugin build
+│   ├── sse/version-1-5-97-0.bin     SE
+│   ├── sse/versionlib-1-6-1170-0.bin AE
+│   └── f4/version-1-11-191-0.bin    F4 AE (primary)
 ├── extras/
-│   └── SkyrimSE.pdb            Crashlogger SE PDB for extra symbol names
-├── ghidrascripts/
-│   ├── CommonLibImport_SE.py   Generated: import SE types + vtables + symbols
-│   └── CommonLibImport_AE.py   Generated: import AE types + vtables + symbols
-├── parse_commonlib_types.py    Generator for CommonLibImport_SE/AE.py
-├── template_types.py           Optional: C++ template instantiation handling
-├── extra_types.json            Manual type definitions (typedefs, enums, opaques)
-└── requirements.txt            Python dependencies
+│   ├── SkyrimSE.pdb                 fallback symbol names for Skyrim SE
+│   └── IDAImportNames_1.11.191.0.py fallback symbol names for F4 AE
+├── exes/
+│   ├── skyrim/se/SkyrimSE.exe
+│   ├── skyrim/ae/SkyrimSE.exe
+│   └── f4/ae/Fallout4.exe
+├── ghidra/                          Ghidra install (12.x)
+├── ghidraprojects/                  Headless Ghidra projects (auto-created)
+├── ghidrascripts/                   Generated import scripts (output)
+└── scripts/
+    ├── run_headless.py              Unified headless runner
+    ├── core/
+    │   ├── clang_types.py           clang AST + record-layout parser
+    │   ├── ghidra_import_gen.py     Game-agnostic Ghidra script emitter
+    │   ├── pdb_symbols.py           PDB public-symbol extraction
+    │   └── template_types.py        C++ template alias generator
+    ├── commonlibsse/
+    │   ├── parse_commonlib_types.py Generates SE + AE scripts
+    │   ├── reloc_parser.py          RELOCATION_ID(SE,AE) regex scanner
+    │   └── address_library.py       SE + AE binary loader
+    └── commonlibf4/
+        ├── parse_commonlib_types.py Generates F4 AE script
+        ├── reloc_parser.py          libxse single-ID regex scanner
+        ├── address_library.py       AE address library loader
+        └── ida_names.py             Parses extras/IDAImportNames_*.py
 ```
-
----
-
-## Plugin Build
-
-### Requirements
-
-| Tool | Notes |
-|------|-------|
-| [CMake](https://cmake.org/) | Add to `PATH` |
-| [Vcpkg](https://github.com/microsoft/vcpkg) | Set `VCPKG_ROOT` environment variable |
-| [Visual Studio 2026](https://visualstudio.microsoft.com/) | Desktop development with C++ workload |
-
-### Register Visual Studio as a CMake Generator
-
-Open an **x64 Native Tools Command Prompt** and run `cmake` once to register the
-generator, then close it.
-
-### Clone and initialise
-
-```bash
-git clone https://github.com/doodlum/GhidraImportScripts.git
-cd GhidraImportScripts
-git submodule update --init --recursive
-```
-
-### Build SE
-
-```bash
-cd plugin
-cmake --preset vs2026-windows-vcpkg-se
-cmake --build build --config Release
-```
-
-### Build AE
-
-```bash
-cd plugin
-cmake --preset vs2026-windows-vcpkg-ae
-cmake --build buildae --config Release
-```
-
-The debug builds copy the PDB to `pdbs/GhidraImport_SE_D.pdb` (or AE) at the
-repo root, where `parse_commonlib_types.py` expects to find them.
-
----
-
-## Ghidra Pipeline Overview
-
-The pipeline produces two Ghidra scripts from the CommonLibSSE source tree and
-address databases. Run the Python generator on the host machine, then run the
-resulting scripts inside Ghidra on a Skyrim SE or AE binary.
-
-```
-CommonLibSSE headers ─┬─ parse_commonlib_types.py ──► CommonLibImport_SE.py
-Address libraries   ──┤                           ──► CommonLibImport_AE.py
-PDB files           ──┘
-extra_types.json ─────────────────────────────────► (embedded in both scripts)
-template_types.py ────────────────────────────────► (optional, auto-used)
-```
-
-**Symbol sources** (in priority order for SE):
-
-1. CommonLibSSE headers — libclang AST (fully-qualified names, signatures)
-2. CommonLibSSE `src/*.cpp` — libclang unity parse (functions not in headers)
-3. `skyrimae.rename` — AE address database fallback names
-4. `SkyrimSE.pdb` — Crashlogger SE PDB public symbols (fallback, no signatures)
-
-**Execution order inside Ghidra** (per binary):
-
-Run **`CommonLibImport_SE.py`** (SE) or **`CommonLibImport_AE.py`** (AE).
-
-This single script:
-- Creates all `RE::` structs, classes, and enums in the Ghidra Data Type Manager
-  under `/CommonLibSSE/RE/`.
-- Populates vtable structs with typed function pointer fields.
-- Applies all function signatures via `CParserUtils.parseSignature()`.
-- Labels all known symbols at their computed addresses.
 
 ---
 
 ## Prerequisites
 
-### Python (host machine, for running the generator)
+- Python 3.10+ (64-bit). Install deps: `pip install pdbparse pyghidra`
+- LLVM/Clang on `PATH` (used for `-ast-dump` and `-fdump-record-layouts`)
+- Ghidra 12.x extracted into `./ghidra/`
+- Submodules initialized:
 
-- Python **3.10+**, **64-bit** (required for the 64-bit libclang DLL)
-- Install dependencies:
-
-```bash
-pip install -r requirements.txt
-# requirements.txt contains: libclang, comtypes
 ```
-
-`libclang` provides the `clang.cindex` bindings used to parse CommonLibSSE
-headers. `comtypes` is used to load the DIA SDK COM interface for PDB type
-extraction.
-
-### CommonLibSSE submodule
-
-The generator reads directly from `extern/CommonLibSSE/`. Ensure the submodule
-is checked out:
-
-```bash
-git submodule update --init extern/CommonLibSSE
+git submodule update --init --recursive
 ```
-
-### PDB files
-
-Place debug PDB files in `pdbs/`. These are used to cross-reference struct sizes
-and vtable layouts:
-
-| File | Purpose |
-|------|---------|
-| `GhidraImport_SE_D.pdb` | SE debug build PDB — struct sizes + vtable data |
-| `GhidraImport_AE_D.pdb` | AE debug build PDB — struct sizes + vtable data |
-
-The DIA SDK (installed with Visual Studio) is used to read PDB type info. If
-`msdia140.dll` is present on the system (it usually is after installing VS), it
-is found automatically via the registry. A manual TPI stream parser provides a
-fallback if COM is unavailable.
-
-### Ghidra
-
-- [Ghidra](https://ghidra-sre.org/) 12.x or later
 
 ---
 
-## Setup
+## Generating the import scripts
 
-All paths are relative to the repository root. The generator finds all inputs
-automatically — no environment variables are required.
-
----
-
-## Running the Generator
-
-Run the generator from the repository root. It writes output into `ghidrascripts/`.
+Run each pipeline from the repo root. They read directly from `extern/<repo>/`
+and write into `ghidrascripts/`.
 
 ```bash
-python parse_commonlib_types.py
+python scripts/commonlibsse/parse_commonlib_types.py   # SE + AE
+python scripts/commonlibf4/parse_commonlib_types.py    # F4 AE
 ```
 
 Outputs:
-- `ghidrascripts/CommonLibImport_SE.py` — SE types, enums, vtables, symbols
-- `ghidrascripts/CommonLibImport_AE.py` — AE types, enums, vtables, symbols
+- `ghidrascripts/CommonLibImport_SE.py`
+- `ghidrascripts/CommonLibImport_AE.py`
+- `ghidrascripts/CommonLibImport_F4_AE.py`
 
-Typical run time: ~60–90 seconds (two full header parse passes + src/ unity parse).
-
-Console output per version:
-```
-SE entries: 142458, AE entries: 167347
-=== Collecting symbols via libclang ===
-Parsing CommonLibSSE headers...
-Collecting types...
-Found 885 enums, 2801 structs/classes
-Computed vtable slots for 507 structs from libclang
-Loading PDB type info from GhidraImport_SE_D.pdb...
-Found 2542 RE:: types in PDB
-PDB cross-reference: 2517 matched, 909 size-ok, 1308 supplemented, 2 mismatched
-Built 1360 vtable structs
-...
-Added N symbols from AE rename database
-Added N symbols from SE PDB
-Output: ghidrascripts/CommonLibImport_SE.py (891 enums, 2853 structs)
-```
-
-### Regeneration
-
-Regenerate whenever:
-- CommonLibSSE submodule is updated (`git submodule update`)
-- `extra_types.json` is edited
-- `template_types.py` or the generator is modified
+Re-run whenever a `extern/CommonLib*` submodule is updated, when address
+library `.bin` files change, or when generator code under `scripts/core/` is
+modified.
 
 ---
 
-## Running the Ghidra Scripts
+## Running headless against the binaries
 
-### Import the binary
+Place each binary under `exes/<game>/<version>/`. The runner auto-discovers all
+present targets.
 
-1. Open Ghidra using `support\pyghidraRun.bat` and create a project.
-2. Import `SkyrimSE.exe` (SE) or the AE executable. Use the default PE import
-   options and skip auto-analysis.
-3. Ignore any error popups. Close them when the script is complete.
-
-### Run CommonLibImport_SE.py or CommonLibImport_AE.py
-
-In the Ghidra Script Manager (`Window → Script Manager`):
-
-1. Add `ghidrascripts/` to the script directories.
-2. Run **`CommonLibImport_SE.py`** for SE binaries or **`CommonLibImport_AE.py`**
-   for AE binaries.
-
-This script:
-- Creates all structs, classes, and enums in the Data Type Manager.
-- Populates vtable structs with typed function pointer fields.
-- Applies vtable function signatures to the virtual function implementations.
-- Applies all symbol labels and function signatures at computed addresses.
-- Prints a summary: `Labels: N, Functions: N, Signatures applied: N, Signatures failed: N`
-
-Both scripts are safe to re-run; they overwrite existing types and labels.
-
----
-
-## Pipeline Files Reference
-
-### `parse_commonlib_types.py`
-
-Single generator for both SE and AE scripts. Parses CommonLibSSE headers with
-libclang to produce struct/enum/vtable data and function symbols.
-
-| Input | Purpose |
-|-------|---------|
-| `extern/CommonLibSSE/include/RE/Skyrim.h` | RE:: namespace types + relocation IDs |
-| `extern/CommonLibSSE/src/*.cpp` | Additional function bodies (unity parse) |
-| `pdbs/GhidraImport_SE_D.pdb` | Authoritative struct sizes and vtable layout |
-| `addresslibrary/` | SE and AE offset databases |
-| `extern/AddressLibraryDatabase/skyrimae.rename` | AE fallback symbol names |
-| `extras/SkyrimSE.pdb` | SE fallback symbol names |
-| `extra_types.json` | Manually defined types not extractable from headers |
-| `template_types.py` | Template instantiation alias generation (auto-imported) |
-
-Output variables in generated scripts:
-- `ENUMS` — list of `(name, size, category, values)` tuples
-- `STRUCTS` — list of `(name, size, category, fields, bases, has_vtable)` tuples
-- `VTABLES` — list of `(name, class_full_name, size, category, slots)` tuples
-- `SYMBOLS` — list of `{n, t, sig, s?, a?, src}` dicts
-- `C_TYPE_PRELUDE` — C declarations prepended to every `CParserUtils.parseSignature()` call
-- `TEMPLATE_TYPE_MAP` — maps `NiPointer<BSTriShape>` → `NiPointer_BSTriShape` etc.
-
-### `extra_types.json`
-
-Manually maintained type definitions for types that cannot be auto-extracted from
-the headers. Loaded by the generator and embedded in both generated scripts.
-See [extra\_types.json Reference](#extra_typesjson-reference) below.
-
-### `template_types.py`
-
-Optional module that scans for C++ template instantiation names and generates
-sanitized C identifier aliases. Automatically imported by the generator when
-present. See [template\_types.py Reference](#template_typespy-reference) below.
-
----
-
-## extra_types.json Reference
-
-File location: `extra_types.json` (repository root)
-
-This file defines types that are either template instantiations, primitive
-typedef aliases, or forward-declared-only types that libclang cannot extract with
-full detail from the CommonLibSSE headers. The generator loads this file and:
-
-1. Injects the types into the Ghidra Data Type Manager.
-2. Emits C declarations into `C_TYPE_PRELUDE` so `CParserUtils.parseSignature()`
-   can parse function signatures that reference these types.
-
-### Schema
-
-```json
-{
-  "_comment": "...",
-
-  "typedefs": {
-    "TypeName": {
-      "base": "u32",
-      "comment": "optional human-readable explanation"
-    }
-  },
-
-  "enums": {
-    "EnumName": {
-      "size": 4,
-      "comment": "...",
-      "values": {
-        "kSomeValue": 0,
-        "kOtherValue": 1
-      }
-    }
-  },
-
-  "opaques": {
-    "StructName": "human-readable description"
-  }
-}
+```bash
+python scripts/run_headless.py                # all games × versions
+python scripts/run_headless.py skyrim         # all skyrim versions
+python scripts/run_headless.py skyrim ae      # specific
+python scripts/run_headless.py f4 ae
 ```
 
-### `typedefs` — integer typedef aliases
+For each target the runner:
+1. Opens or creates `ghidraprojects/<game>_<version>/`
+2. Imports the `.exe` if not already present
+3. Runs the matching `CommonLibImport_*.py`
+4. Saves the program
+5. Prints a verification summary (named functions, type spot-checks,
+   game-specific labels/functions)
 
-| Field | Values | Description |
-|-------|--------|-------------|
-| `base` | `u8` `i8` `u16` `i16` `u32` `i32` `u64` `i64` | Underlying integer type |
-| `comment` | string | Optional description |
-
-Emitted as `typedef unsigned int FormID;` etc. in `C_TYPE_PRELUDE`.
-
-### `enums` — enum definitions
-
-| Field | Values | Description |
-|-------|--------|-------------|
-| `size` | `1` `2` `4` `8` | Byte size of the enum |
-| `values` | `{ "kName": N }` | Enumerator name → integer value pairs |
-| `comment` | string | Optional description |
-
-Enums with no `values` (empty `{}`) are emitted as `typedef unsigned int Name;`
-since CParserUtils cannot parse empty enum bodies.
-
-### `opaques` — forward-declared / opaque structs
-
-Any type that is forward-declared only, has an unknown layout, or is only
-referenced by pointer. Created as a zero-size opaque struct in the Ghidra Data
-Type Manager. Emitted as:
-```c
-struct Name;
-typedef struct Name Name;
-```
-
-### Adding new types
-
-Add types here when a Ghidra script run produces a `SIG FAIL` for a function
-whose signature contains an unknown type name. Identify the type in CommonLibSSE
-headers to determine whether it belongs in `typedefs`, `enums`, or `opaques`,
-then regenerate both scripts.
+Exit code is non-zero if any target's spot-checks or sanity thresholds fail.
 
 ---
 
-## template_types.py Reference
+## Pipeline overview
 
-File location: `template_types.py` (repository root)
+```
+extern/CommonLib*/include/    ─── reloc_parser.py         ──► symbols (game-version offsets)
+addresslibrary/<game>/*.bin   ─── address_library.py      ──┘
 
-Handles C++ template instantiation type names such as `NiPointer<BSTriShape>` and
-`BSTArray<NiPointer<CombatInventoryItem>>`. These names contain angle brackets
-and cannot appear in C function prototype strings that Ghidra's
-`CParserUtils.parseSignature()` processes.
+extern/CommonLib*/include/    ─── clang -ast-dump         ──► enums, classes, methods, vtables
+                              ─── clang -fdump-record-layouts ─► struct field offsets + sizes
 
-### What it does
+extras/SkyrimSE.pdb           ─── pdb_symbols.py          ──► Skyrim fallback symbols
+extras/IDAImportNames_*.py    ─── ida_names.py            ──► F4 fallback symbols
 
-1. **Scans** struct field descriptors and raw PDB signature strings for
-   `Word<...>` template instantiation names, handling arbitrary nesting.
-2. **Generates** a sanitized C identifier alias for each:
-   - `NiPointer<BSTriShape>` → `NiPointer_BSTriShape`
-   - `BSTEventSource<ActorKill::Event>` → `BSTEventSource_ActorKill_Event`
-   - `BSTSmallArray<TESForm *, 6>` → `BSTSmallArray_TESForm_ptr_6`
-3. **Extends** `C_TYPE_PRELUDE` with forward declarations for the alias names.
-4. **Embeds** a `TEMPLATE_TYPE_MAP` dict and `_patch_templates(proto)` function
-   in each generated script. Before every `parseSignature()` call the proto
-   string is patched so template names are replaced by their aliases.
-
-### Integration
-
-`template_types.py` is imported automatically (via `try/except ImportError`) by
-the generator. If the file is absent the pipeline continues without template
-support — all template-typed parameters fall back to `void *`.
-
-### Public API
-
-```python
-from template_types import (
-    sanitize_template_name,   # 'NiPointer<BSTriShape>' -> 'NiPointer_BSTriShape'
-    extract_template_names,   # find all Word<...> in a string
-    collect_template_names,   # scan struct descriptors + sig strings
-    build_template_result,    # TemplateResult from a set of names
-    patch_proto_templates,    # substitute names in a proto string (generation-time)
-    process_template_types,   # main entry point
-)
+parse_commonlib_types.py      ─── orchestrates each game ─┐
+ghidra_import_gen.py          ─── emits the .py script ───┴─► ghidrascripts/CommonLibImport_*.py
 ```
 
-`process_template_types(structs, extra_types, sig_strings)` returns a
-`TemplateResult` containing:
+**Symbol sources** (priority order):
 
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `template_map` | `dict[str, str]` | `original → sanitized` |
-| `c_prelude_fragment` | `str` | C typedef/forward-decl block |
-| `map_source` | `str` | Python source: `TEMPLATE_TYPE_MAP = {...}` |
-| `patch_fn_source` | `str` | Python source: `def _patch_templates(proto): ...` |
+1. `RELOCATION_ID(SE, AE)` (Skyrim) or `REL::ID Name{id}` (F4 libxse) macros
+2. `Offsets_RTTI.h`, `Offsets_NiRTTI.h`, `Offsets_VTABLE.h` labels
+3. `RE::Offset::` namespace IDs (Skyrim)
+4. CommonLibSSE `src/*.cpp` cross-references (Skyrim only)
+5. Fallback: AE rename DB (`skyrimae.rename`) — Skyrim AE only
+6. Fallback: PDB public symbols (`SkyrimSE.pdb`) — Skyrim
+7. Fallback: IDA `NAME(addr, …)` script (`IDAImportNames_1.11.191.0.py`) — F4 AE
+
+Fallback symbols whose address lands on a known CommonLib vtable slot are
+re-tagged with the slot's CommonLib name (and filed under `/CommonLibSSE/`
+or `/CommonLibF4/` in the Data Type Manager) instead of the original
+PDB/rename/IDA name.
 
 ---
 
-## Known Limitations
+## Generated script behaviour
 
-### Function signatures — template parameter degradation
+Each `CommonLibImport_*.py` is a self-contained Jython script that:
 
-When a `REL::Relocation<func_t>` variable declaration contains complex template
-types (e.g. `BSScrapArray<ActorHandle>*`), libclang's error recovery degrades the
-type to `int`. The function is found at the correct address; only the parameter
-type spelling is wrong. Affected parameters show as `int *` instead of the real
-type.
+- Creates all enums, structs, primary + secondary vtable structs under
+  `/CommonLib<Game>/`
+- Populates struct fields with computed offsets and types (including
+  flattened base-class fields and per-class secondary `__vftable_<base>`
+  pointers for multi-inheritance)
+- Names virtual functions by walking vtable addresses in the binary
+- Applies function signatures by building a `FunctionDefinitionDataType`
+  directly from the pipeline's structured type descriptors (falling back
+  to `CParserUtils.parseSignature()` with `void *` substitution for the
+  rare cases the structured path can't resolve)
+- Labels every known address-library symbol
+- Adds a `Source: <origin>` plate comment to each named function so you
+  can tell which fallback table claimed a name
 
-### Function signatures — Offset:: namespace
+The scripts are idempotent — safe to re-run; they overwrite types/labels.
 
-Functions using `RE::Offset::` IDs use a two-stage AST/token-scan fallback. Exotic
-initialisers (macros expanding to Offset references, nested template expressions)
-are silently skipped.
+---
 
-### Five uncaptured functions
+## Known limitations
 
-The following are not captured by any extraction path:
+The pipeline guarantees correctness as a hard rule: every emitted struct field
+or signature parameter points at the **exact** type declared in the source.
+Anything we can't pin to an exact type is left as bare `ptr` (Ghidra renders
+this as `void *`) instead of being upgraded to a guessed type. Counts below
+are from the most recent run.
 
-- `BSPointerHandleManager::GetHandleEntries` — array bound `0x100000` in the
-  template type argument shadows the real `RELOCATION_ID`.
-- `RTTI::from`, `RTTI::to`, `NiObjectNET::rtti`, `NiRTTI::to` — offsets inside
-  template functions depend on the concrete template type parameter; no integer
-  RELOCATION_ID is present.
+| | F4 AE | Skyrim AE | Skyrim SE |
+| --- | --- | --- | --- |
+| Total struct fields | 24,216 | 34,243 | 34,231 |
+| Bare-`ptr` fields | 58 (0.24%) | 84 (0.25%) | 84 (0.25%) |
+| Signatures with unresolved template params | 0 | 0 | 0 |
+| Struct fields referencing unresolved template params | 0 | 0 | 0 |
+| Vtable structs built | 1,292 | 2,023 | 2,024 |
 
-### Missing `binary_io` dependency
+The remaining ~0.25% bare-`ptr` fields fall into a small number of categories
+that genuinely *are* opaque pointers in the source:
 
-`binary_io/file_stream.hpp` is not in the `extern/` tree. libclang emits one parse
-error per pass and recovers; types that depend on that header are skipped or receive
-degraded `int` types. The error is suppressed in console output.
+- **Function-pointer typedef fields.** Members declared as a pointer to a
+  named function-type alias (e.g. Havok `ShapeFuncs::getSupportingVertexFunc`,
+  `BSAudioCallbacks::idCallback`, the various `_readFn` / `_writeFn`
+  callbacks) are 8-byte function pointers but the pipeline doesn't currently
+  emit a Ghidra `FunctionDefinitionDataType` for the typedef, so the field is
+  typed as plain `ptr`. The byte layout is exact; only the parameter
+  annotation is missing. Skyrim contains ~24 such fields in `ShapeFuncs` /
+  `ShapeFuncs2` and a handful elsewhere.
+- **Type-erased STL containers.** `std::_Tree_node<..., void*>` and similar
+  STL nodes use `void*` as their second template argument, which makes
+  `_Left` / `_Right` / `_Parent` truly `void*` at the source level. The
+  bare `ptr` type is correct here.
+- **STL stream classes.** `basic_ostream`, `basic_ostringstream`, `ios_base`
+  and a handful of related types have `has_vtable=True` but their virtual
+  destructors / methods are declared in MSVC headers we don't pull in. Their
+  derived `__vftable` pointers stay bare. F4: 6 fields, Skyrim: 7 fields.
+- **Skipped uninstantiated-template signatures.** Template member functions
+  whose RELOCATION_ID lives on the unspecialised template (e.g.
+  `BSPointerHandleManagerInterface<T>::CreateHandle(T*)`) have a parameter
+  type that's literally the template parameter `T`. Rather than apply a
+  signature with `T*` (which would resolve to `void*` in Ghidra and so
+  silently mis-type the argument), the orchestrators skip the signature
+  entirely and only apply the function's name. ~2-3 such symbols per game.
+- **Fallback-symbol coverage.** F4 fallback names come from the IDA script
+  `extras/IDAImportNames_1.11.191.0.py` (3,639 hand-named addresses), so
+  most F4 names still come from the CommonLibF4 ID database; the IDA script
+  fills in helpers and globals that have no `REL::ID` mapping. Skyrim
+  fallback names come from `extras/SkyrimSE.pdb`'s public-symbol table.
+- **Special-character template names.** A handful of x86 emit-helper templates
+  use byte literals as non-type template arguments (`BRANCH5<'\xe8'>`,
+  `BRANCH6<'\x15'>`); the resulting struct names contain backslash escapes.
+  They work in Ghidra but render unusually in the Data Type Manager.
 
-### Struct size discrepancies
-
-Two classes have genuine size disagreements between libclang and the PDB:
-
-| Class | libclang | PDB |
-|-------|----------|-----|
-| `RE::AttackAnimationArrayMap` | 16 | 64 |
-| `RE::bhkTelekinesisListener` | 8 | 16 |
-
-libclang's layout is used for these. If the PDB is absent, all struct sizes fall
-back to libclang's `sizeof` estimate.
-
-### Vtable slot computation
-
-Slot indices are computed by counting virtual method declarations in base-class
-order. Diamond inheritance with shared virtual bases may produce incorrect slot
-numbers.
-
-### Template instantiation layout
-
-Template field types preserve the full instantiation name
-(e.g. `NiPointer<BSTriShape>`) from libclang's `Type.spelling`. The corresponding
-Ghidra struct is an opaque placeholder — field layout inside the instantiation is
-not resolved. Only types that are explicitly specialised in the CommonLibSSE
-headers get full field data.
-
-### CParserUtils type resolution
-
-Ghidra's `CParserUtils.parseSignature()` resolves type names against the
-`C_TYPE_PRELUDE` declarations prepended to each proto. Types not covered by
-`C_TYPE_PRELUDE` or by the Data Type Manager are replaced with `void *` by the
-`sanitize_unknown_types()` fallback. Add missing types to `extra_types.json` to
-improve coverage.
+Outside that, every struct field's offset, size, and (where typed) referenced
+type matches what clang emits for the layout. Vtable structs include exact
+slot indices from clang's `-fdump-vtable-layouts` (preferred) or the AST
+fallback, and per-(class, subobject offset) secondary vtable structs are
+generated for multi-inheritance so each `__vftable_<base>` field at a
+non-zero offset points at the most-derived class's secondary struct rather
+than the base's primary.
 
 ---
 

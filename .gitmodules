@@ -5,3 +5,7 @@
 [submodule "extern/AddressLibraryDatabase"]
 	path = extern/AddressLibraryDatabase
 	url = https://github.com/meh321/AddressLibraryDatabase
+[submodule "extern/CommonLibF4"]
+	path = extern/CommonLibF4
+	url = https://github.com/libxse/commonlibf4.git
+	branch = main
